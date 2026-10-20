@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   type CapturedTools,
   captureTools,
+  refusalSaying,
   type SpawnStub,
   stubSpawn,
 } from "../../../scripts/connector-tool-harness.ts";
@@ -119,6 +120,23 @@ describe("athena_get", () => {
     ).rejects.toThrow();
     expect(spawn?.calls).toHaveLength(0);
   });
+
+  it("rejects a name the CLI would read from a local file or a URL instead", async () => {
+    // The AWS CLI replaces file://<path> by that file's contents and sends them to Athena as the
+    // name, and an error naming the value can quote them back.
+    for (const [args, refusal] of [
+      [{ catalog: "file:///etc/passwd", database: "d", table: "t" }, "file://"],
+      [{ catalog: "c", database: "fileb://C:/Users/me/.aws/credentials", table: "t" }, "fileb://"],
+      [{ catalog: "c", database: "d", table: "https://example.invalid/t" }, "https://"],
+    ] as const) {
+      cli({});
+      await expect(tools.call("athena_get", args)).rejects.toThrow(
+        refusalSaying(`must not start with "${refusal}"`),
+      );
+      expect(spawn?.calls).toHaveLength(0);
+      spawn?.restore();
+    }
+  });
 });
 
 describe("athena_search", () => {
@@ -154,6 +172,23 @@ describe("athena_search", () => {
       matches: unknown[];
     };
     expect(out.matches).toHaveLength(1);
+  });
+
+  it("skips database and table entries that are not objects", async () => {
+    cli({ DatabaseList: [null, "sales", ["sales"], { Name: "sales" }] });
+    const dbs = (await tools.callJson("athena_search", { catalog: "c", query: "sal" })) as {
+      matches: unknown[];
+    };
+    expect(dbs.matches).toEqual([{ Name: "sales" }]);
+
+    spawn?.restore();
+    cli({ TableMetadataList: [7, { Name: "users" }] });
+    const tables = (await tools.callJson("athena_search", {
+      catalog: "c",
+      database: "d",
+      query: "user",
+    })) as { matches: unknown[] };
+    expect(tables.matches).toEqual([{ Name: "users" }]);
   });
 
   it("returns no matches when the CLI reports an unexpected envelope", async () => {

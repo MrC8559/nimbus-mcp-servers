@@ -20,11 +20,39 @@ The properties this package claims, and therefore the ones a report can be filed
 - **The write-scope allow-list.** `NIMBUS_MCP_<SERVICE>_WRITE_SCOPE` is enforced server-side and is
   unreachable by the model. Unset authorises nothing; a write that proceeds on an empty scope is a
   vulnerability.
-- **The mutation budget.** `NIMBUS_MCP_WRITE_BUDGET` caps mutations per session.
+- **The mutation budget.** `NIMBUS_MCP_WRITE_BUDGET` caps mutations per session, `10` when unset.
+  A value that is set must be a whole number in plain digits, from `0`, which refuses every write,
+  to `9007199254740991`, with any whitespace around it ignored. Any other value, an empty one
+  included, stops a connector that has write tools at startup rather than running it under some
+  other cap. A mutation past the budget, or any mutation while the variable holds a value outside
+  that rule, is a vulnerability.
+- **The audit log.** When `NIMBUS_MCP_AUDIT_LOG` is set, each step of every write is appended to a
+  hash-chained log that any number of connector processes may share: appends are serialised within
+  a process and, through a lock file beside the log, across processes. A write runs only once its
+  `requested` and `accepted` lines are in the log. A line that links to anything but the line
+  written before it, or a write that runs without those two lines, is a vulnerability, unless one
+  of the lock's bounds listed below accounts for it.
 - **Credential handling.** Credentials come from the environment and must never appear in a tool
   result, a log line, or an error message.
-- **Argument handling.** A connector that shells out must not let a tool argument smuggle a flag or
-  escape into the command — see `shared/safe-cli-arg.ts`.
+- **Argument handling.** A connector that drives a CLI spawns it with an argv array and no shell,
+  and a tool argument must reach the CLI as the value it was meant to be. Three rules make that
+  hold, each enforced before anything runs:
+  - a value starting with `-` is refused, since the CLI would read it as a flag: a pod named
+    `--kubeconfig=<path>` would load that kubeconfig, whose exec credential plugin runs a command;
+  - a value the CLI would replace by reading something else is refused — `file://`, `fileb://`,
+    `http://`, `https://` or the shorthand operator `@=` for `aws`, a leading `@` or `=@` for `az` —
+    since what it read would be sent to the cloud API, and an error could quote it back;
+  - on Windows, where `az` and `gcloud` are batch files that `cmd.exe` parses a second time, the
+    spawn itself refuses an argument holding `% ! " & | < > ^ ( )` or a control character whenever
+    the program may be a `.cmd` or `.bat` — judged by the file its name resolves to first on
+    `PATH`, looked up as the runtime looks it up — since those would run a second command or
+    expand an environment variable into the argument.
+
+  The first two are the argument schemas in `shared/cli-json-kit.ts`, from the rules in
+  `shared/safe-cli-arg.ts`, and every caller-supplied value that reaches a CLI passes one of them;
+  the third is `shared/windows-batch-args.ts`, applied by `shared/nimbus-spawn.ts`, the only file
+  that starts a process. A tool argument that reaches a CLI past them, or a process started
+  anywhere else, is a vulnerability.
 
 ## What is NOT in scope
 
@@ -36,6 +64,23 @@ Stated plainly, because the difference is the whole point of [`NOTICE`](./NOTICE
   Nimbus gateway and no published package can supply them.
 - **A client that does not implement MCP `elicitation`** is served read tools only. That is the
   designed behaviour — a tool the model cannot see is one it cannot call without a human.
+- **The audit log's chain shows its lines are consistent and in order, not that they are the
+  originals or all of them.** The chain is unkeyed, so anyone who can write the file can change an
+  entry and recompute every hash after it, cut lines off its end, or rewrite it from scratch, and
+  still have a chain that verifies. It catches an edit made without recomputing the chain.
+- **The audit log's lock has bounds**, listed in full in
+  [Configuration](./docs/configuration.md#the-audit-log):
+  - A writer stalled for more than 10 seconds partway through an append has its lock taken over.
+    If the takeover lands between that writer's last check and its write, two lines can link to
+    one predecessor.
+  - A hard link to the log, or a container mount of the log file alone, gets a lock of its own.
+  - Machines sharing a log over a network share need distinct hostnames and clocks within 10
+    seconds of the file server's. Network filesystems are untested.
+  - With Windows and WSL processes writing one log on WSL's `/mnt` drives, an append can be
+    reported as failed although its entry was written.
+  - A connector from 0.2.2 or earlier appends without the lock.
+  - Verifying the chain reads the log without the lock, so a line still being written reads as a
+    break.
 
 If a report depends on one of the above, it is a documentation question rather than a
 vulnerability, and an issue is the right place for it.

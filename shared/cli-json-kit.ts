@@ -14,14 +14,38 @@
  *
  * The argument guard is the reason this is worth sharing rather than tolerating:
  * it is a security control, and a security control that exists in five
- * hand-written copies is one that can be strengthened in four of them.
+ * hand-written copies is one that can be strengthened in four of them. Every
+ * caller-supplied value that reaches a CLI's argv, in all eleven connectors
+ * that spawn one, now passes one of the argument schemas here — including in
+ * the connectors that spawn through `run-cli-json.ts` rather than
+ * {@link createCliJsonRunner}; bigquery's values never reach argv at all. And
+ * `scripts/cli-argument-guards.test.ts` fails a tool whose schema lets a value
+ * the CLI would misread through, whether or not something later refuses it.
+ *
+ * The `gcloud` connectors (bigquery, cloud-logging, gcp, vertex-ai) also share
+ * how they hand gcloud its project and credentials: see {@link gcloudEnv} and
+ * {@link gcloudProjectArgs}.
  */
 
 import { z } from "zod";
-import { isSafeCliArg } from "./safe-cli-arg.ts";
+import { optionalEnv } from "./env-json-api.ts";
+import { awsCliArgProblem, azCliArgProblem, cliArgProblem } from "./safe-cli-arg.ts";
 
 /** Body-snippet length in the thrown error. The value every connector used. */
 export const DEFAULT_STDERR_SNIPPET = 400;
+
+/**
+ * A Zod string that refuses every value `problem` names a reason against, with that reason as the
+ * message — so a refused call says which rule it broke rather than listing all of them.
+ */
+function cliArgSchema(problem: (value: unknown) => string | undefined): z.ZodString {
+  return z
+    .string()
+    .min(1)
+    .refine((value) => problem(value) === undefined, {
+      error: (issue) => problem(issue.input) ?? "is not a safe CLI argument",
+    });
+}
 
 /**
  * A value passed to a CLI as an argument.
@@ -30,10 +54,20 @@ export const DEFAULT_STDERR_SNIPPET = 400;
  * `-` would be read by the CLI as a flag rather than as the name it is meant to
  * be, and control characters have no legitimate place in one.
  */
-export const cliArg = z
-  .string()
-  .min(1)
-  .refine(isSafeCliArg, { message: 'must not start with "-" or contain control characters' });
+export const cliArg = cliArgSchema(cliArgProblem);
+
+/**
+ * A value passed to the `aws` CLI as an argument: {@link cliArg}, and not a value the CLI would
+ * replace by reading a file or fetching a URL (`file://`, `fileb://`, `http://`, `https://`), nor
+ * one carrying the shorthand file-load operator `@=`.
+ */
+export const awsCliArg = cliArgSchema(awsCliArgProblem);
+
+/**
+ * A value passed to the `az` CLI as an argument: {@link cliArg}, and not one `az` would replace by
+ * a file's contents — a leading `@`, or `=@` anywhere.
+ */
+export const azCliArg = cliArgSchema(azCliArgProblem);
 
 /** The spawn seam. Production passes `nimbusSpawn`; tests pass a fake. */
 export type SpawnFn = (
@@ -115,4 +149,31 @@ export function asArray(parsed: unknown, key: string): unknown[] {
 /** Case-insensitive substring match on one string field of an untyped entry. */
 export function fieldMatches(entry: unknown, key: string, query: string): boolean {
   return isRecord(entry) && strField(entry, key).toLowerCase().includes(query.toLowerCase());
+}
+
+// ---------------------------------------------------------------------------
+// gcloud
+// ---------------------------------------------------------------------------
+
+/**
+ * `["--project", <id>]` when `GOOGLE_CLOUD_PROJECT` is set at spawn, else `[]`, which leaves
+ * gcloud on the project it is configured with.
+ */
+export function gcloudProjectArgs(): string[] {
+  const project = optionalEnv("GOOGLE_CLOUD_PROJECT", "");
+  return project === "" ? [] : ["--project", project];
+}
+
+/**
+ * The environment for a `gcloud` spawn: the process environment, with
+ * `GOOGLE_APPLICATION_CREDENTIALS` — the key file gcloud reads natively — re-set to its trimmed
+ * value when it is set.
+ */
+export function gcloudEnv(): Record<string, string | undefined> {
+  const env = { ...process.env } as Record<string, string | undefined>;
+  const credentials = process.env["GOOGLE_APPLICATION_CREDENTIALS"]?.trim();
+  if (credentials !== undefined && credentials !== "") {
+    env["GOOGLE_APPLICATION_CREDENTIALS"] = credentials;
+  }
+  return env;
 }

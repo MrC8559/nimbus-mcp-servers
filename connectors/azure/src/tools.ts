@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { azCliArg } from "../../../shared/cli-json-kit.ts";
 import type { ConsentServer } from "../../../shared/consent-kit.ts";
 import { createWriteToolRegistrar } from "../../../shared/consent-kit.ts";
 import {
@@ -6,7 +7,7 @@ import {
   createZodToolRegistrar,
   mcpJsonResult as jsonResult,
 } from "../../../shared/mcp-tool-kit.ts";
-import { runCliJson, runCliOk } from "../../../shared/run-cli-json.ts";
+import { runCliJsonThrowing, runCliOkThrowing } from "../../../shared/run-cli-json.ts";
 
 function azEnv(): Record<string, string | undefined> {
   return { ...process.env } as Record<string, string | undefined>;
@@ -14,11 +15,7 @@ function azEnv(): Record<string, string | undefined> {
 
 async function azJson(args: string[]): Promise<unknown> {
   const cmd = ["az", ...args, "-o", "json"];
-  const r = await runCliJson(cmd, azEnv());
-  if (!r.ok) {
-    throw new Error(r.message);
-  }
-  return r.data ?? {};
+  return (await runCliJsonThrowing(cmd, azEnv())) ?? {};
 }
 
 /** Tool names exposed by this connector — for contract/introspection tests. */
@@ -48,8 +45,8 @@ export function registerAzureTools(
     "azure_app_service_list",
     "List App Services in a resource group.",
     z.object({
-      subscriptionId: z.string().min(1),
-      resourceGroup: z.string().min(1),
+      subscriptionId: azCliArg,
+      resourceGroup: azCliArg,
     }),
     async (p) =>
       jsonResult(
@@ -73,12 +70,12 @@ export function registerAzureTools(
     },
     "Restart an App Service.",
     z.object({
-      subscriptionId: z.string().min(1),
-      resourceGroup: z.string().min(1),
-      name: z.string().min(1),
+      subscriptionId: azCliArg,
+      resourceGroup: azCliArg,
+      name: azCliArg,
     }),
     async (p) => {
-      const r = await runCliOk(
+      await runCliOkThrowing(
         [
           "az",
           "webapp",
@@ -92,9 +89,6 @@ export function registerAzureTools(
         ],
         azEnv(),
       );
-      if (!r.ok) {
-        throw new Error(r.message);
-      }
       return jsonResult({ ok: true });
     },
   );
@@ -108,14 +102,14 @@ export function registerAzureTools(
     },
     "Scale an AKS node pool.",
     z.object({
-      subscriptionId: z.string().min(1),
-      resourceGroup: z.string().min(1),
-      clusterName: z.string().min(1),
-      poolName: z.string().min(1),
+      subscriptionId: azCliArg,
+      resourceGroup: azCliArg,
+      clusterName: azCliArg,
+      poolName: azCliArg,
       nodeCount: z.number().int().min(0),
     }),
     async (p) => {
-      const r = await runCliOk(
+      await runCliOkThrowing(
         [
           "az",
           "aks",
@@ -134,9 +128,6 @@ export function registerAzureTools(
         ],
         azEnv(),
       );
-      if (!r.ok) {
-        throw new Error(r.message);
-      }
       return jsonResult({ ok: true });
     },
   );

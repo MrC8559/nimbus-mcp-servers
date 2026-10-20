@@ -1,13 +1,18 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { McpListResult } from "@nimbus-dev/sdk/connector-kit";
 import { z } from "zod";
 
 import { verifyAuditChain } from "./audit-chain.ts";
 import { resetConnectorModeForTests, setConnectorMode } from "./connector-mode.ts";
-import { type ConsentServer, createWriteToolRegistrar } from "./consent-kit.ts";
+import {
+  type ConsentServer,
+  createWriteToolRegistrar,
+  type WriteToolRegistrar,
+} from "./consent-kit.ts";
+import { DEFAULT_WRITE_BUDGET, WRITE_BUDGET_ENV } from "./write-budget.ts";
 
 type Registered = { name: string };
 
@@ -46,8 +51,29 @@ function fakeServer(opts: {
 
 const schema = z.object({ branch: z.string() });
 
+/**
+ * The registrar reads these at construction, and the helpers below set them per case. Restore
+ * them after every case: bun runs many test files in ONE process, and an audit-log path left
+ * behind here would collect the audit entries of every later file's standalone writes.
+ */
+const KIT_ENV = ["NIMBUS_MCP_TEST_WRITE_SCOPE", "NIMBUS_MCP_WRITE_BUDGET", "NIMBUS_MCP_AUDIT_LOG"];
+const savedKitEnv = new Map(KIT_ENV.map((k) => [k, process.env[k]]));
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const [key, value] of savedKitEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+afterAll(async () => {
+  await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
 async function tempAuditPath(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "nimbus-consent-"));
+  tempDirs.push(dir);
   return join(dir, "audit.jsonl");
 }
 
@@ -352,6 +378,148 @@ describe("client-independent controls", () => {
     expect(JSON.stringify(await call({ branch: "acme/api" }))).toMatch(/budget/i);
   });
 
+  test("a spent budget refuses BEFORE prompting — no human is asked to approve the impossible", async () => {
+    // The re-check after consent would keep the count right on its own; this check, before
+    // consent, is what keeps a human from being asked to approve a write that cannot happen.
+    let prompted = 0;
+    const srv = serverWith(() => {
+      prompted += 1;
+      return Promise.resolve({ action: "accept", content: { confirm: true } });
+    });
+    const call = registerAndGet(srv, async () => ok(), { scope: "repo:acme/api", budget: 1 });
+    await call({ branch: "acme/api" });
+    expect(JSON.stringify(await call({ branch: "acme/api" }))).toMatch(/budget exhausted/i);
+    expect(prompted).toBe(1);
+  });
+
+  test("approved calls in flight together cannot overrun the budget", async () => {
+    // The SDK runs each request's handler as it arrives, so a client that sends several tool
+    // calls without waiting has them all past the pre-consent budget check before any of them has
+    // spent from it. Measured through the real argocd entry point before the fix: under a budget
+    // of 1, three such approved syncs all reached the network.
+    let executed = 0;
+    const outcomes: string[] = [];
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    srv.sendLoggingMessage = (p) => {
+      outcomes.push((p.data as { outcome: string }).outcome);
+      return Promise.resolve();
+    };
+    const call = registerAndGet(
+      srv,
+      async () => {
+        executed += 1;
+        return ok();
+      },
+      { scope: "repo:acme/api", budget: 1 },
+    );
+
+    const answers = await Promise.all([1, 2, 3].map(() => call({ branch: "acme/api" })));
+
+    expect(executed).toBe(1);
+    expect(
+      answers.filter((a) => JSON.stringify(a).includes("write budget exhausted")),
+    ).toHaveLength(2);
+    // All three were put to the human and approved: the budget, not the human, stopped two.
+    expect(outcomes.filter((o) => o === "accepted")).toHaveLength(3);
+    expect(outcomes.filter((o) => o === "refused")).toHaveLength(2);
+    expect(outcomes.filter((o) => o === "executed")).toHaveLength(1);
+  });
+
+  test("a write approved after the budget ran out is refused, and the log says it was approved", async () => {
+    // Two writes are put to the human together under a budget of one. The second is approved first
+    // and spends the budget; the first is approved after that and must not run. Its audit entry
+    // has to say the budget stopped it AFTER a human said yes, which `budget exhausted` alone
+    // would not: that reason is also what a refusal before any prompt records.
+    let prompts = 0;
+    const approvals: Array<() => void> = [];
+    let onPrompt = (): void => undefined;
+    const nextPrompt = (): Promise<void> =>
+      new Promise((resolve) => {
+        onPrompt = () => resolve();
+      });
+    const approve = (i: number): void => {
+      const go = approvals[i];
+      if (go === undefined) throw new Error(`prompt ${String(i)} is not open`);
+      go();
+    };
+    const srv = serverWith(() => {
+      prompts += 1;
+      // Only the first two writes may be put to the human, which is asserted below. A third
+      // prompt is answered at once, so that failure is reported instead of waiting forever.
+      if (prompts > 2) return Promise.resolve({ action: "accept", content: { confirm: true } });
+      return new Promise((resolve) => {
+        approvals.push(() => resolve({ action: "accept", content: { confirm: true } }));
+        onPrompt();
+      });
+    });
+    let executed = 0;
+    const log = await tempAuditPath();
+    const call = registerAndGet(
+      srv,
+      async () => {
+        executed += 1;
+        return ok();
+      },
+      { scope: "repo:acme/api", budget: 1, auditLog: log },
+    );
+
+    // Each race ends when the call's prompt opens, or when the call ends without one, so a call
+    // that never prompts fails the length check below instead of stalling the test.
+    let open = nextPrompt();
+    const first = call({ branch: "acme/api" });
+    await Promise.race([open, first]);
+    open = nextPrompt();
+    const second = call({ branch: "acme/api" });
+    await Promise.race([open, second]);
+    expect(approvals).toHaveLength(2);
+
+    approve(1);
+    expect(JSON.stringify(await second)).not.toContain("budget exhausted");
+    approve(0);
+    expect(JSON.stringify(await first)).toContain("write budget exhausted for this session");
+    // With the budget spent, a third write is refused before anyone is asked.
+    expect(JSON.stringify(await call({ branch: "acme/api" }))).toContain("write budget exhausted");
+
+    expect(prompts).toBe(2);
+    expect(executed).toBe(1);
+    type Line = { entry: { outcome: string; detail: { reason?: string } } };
+    const entries = (await readFile(log, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((l) => (JSON.parse(l) as Line).entry);
+    expect(entries.map((e) => [e.outcome, e.detail.reason])).toEqual([
+      ["requested", undefined],
+      ["requested", undefined],
+      ["accepted", undefined],
+      ["executed", undefined],
+      ["accepted", undefined],
+      ["refused", "budget exhausted after approval"],
+      ["refused", "budget exhausted"],
+    ]);
+    expect(await verifyAuditChain(log)).toMatchObject({ ok: true });
+  });
+
+  test("approved calls in flight together leave one intact chain in the audit log", async () => {
+    // The calls' records interleave — every call is approved before any executes — and each one
+    // links to the record actually written before it. They used to read the same tail and link to
+    // the same predecessor, so the chain broke at the second record.
+    const calls = 5;
+    const log = await tempAuditPath();
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    const call = registerAndGet(srv, async () => ok(), { scope: "repo:acme/api", auditLog: log });
+
+    await Promise.all(Array.from({ length: calls }, () => call({ branch: "acme/api" })));
+
+    expect(await verifyAuditChain(log)).toEqual({ ok: true, count: calls * 3 });
+    const outcomes = (await readFile(log, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((l) => (JSON.parse(l) as { entry: { outcome: string } }).entry.outcome);
+    for (const outcome of ["requested", "accepted", "executed"]) {
+      expect(outcomes.filter((o) => o === outcome)).toHaveLength(calls);
+    }
+  });
+
   test("capturePreState runs before the mutation and reaches the audit log", async () => {
     const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
     const log = await tempAuditPath();
@@ -486,4 +654,362 @@ describe("pre-state capture failure", () => {
     expect(text).toContain("ref lookup failed");
     expect(text).toContain('"executed"');
   });
+});
+
+describe("standalone outcomes at the edges", () => {
+  beforeEach(() => {
+    resetConnectorModeForTests();
+    setConnectorMode("standalone");
+  });
+  afterEach(() => {
+    resetConnectorModeForTests();
+  });
+
+  /** The audit entries a log holds, in order. */
+  async function entries(log: string): Promise<{ outcome: string; detail: unknown }[]> {
+    return (await readFile(log, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((l) => (JSON.parse(l) as { entry: { outcome: string; detail: unknown } }).entry);
+  }
+
+  /** Register one approved write whose pre-state capture and handler are given. */
+  function registered(
+    log: string,
+    capture: () => Promise<Record<string, unknown>>,
+    handler: () => Promise<McpListResult>,
+  ): (args: unknown) => Promise<McpListResult> {
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    process.env["NIMBUS_MCP_TEST_WRITE_SCOPE"] = "repo:acme/api";
+    process.env["NIMBUS_MCP_AUDIT_LOG"] = log;
+    const reg = createWriteToolRegistrar(srv, {
+      connector: "github",
+      scopeEnv: "NIMBUS_MCP_TEST_WRITE_SCOPE",
+      scopeKinds: ["repo"],
+    });
+    reg(
+      "github_branch_delete",
+      {
+        mutates: "github.branch.delete",
+        recoverable: false,
+        capturePreState: capture,
+        scopeTargetOf: (a: { branch: string }) => ({ kind: "repo", value: a.branch }),
+      },
+      "Delete a branch.",
+      z.object({ branch: z.string() }),
+      handler,
+    );
+    srv.handshake();
+    const cb = srv.captured;
+    if (cb === undefined) throw new Error("tool was not registered");
+    return cb;
+  }
+
+  test("a pre-state capture that rejects with a non-Error still records why", async () => {
+    const log = await tempAuditPath();
+    const call = registered(
+      log,
+      () => Promise.reject("ref service unavailable"),
+      () => Promise.resolve(ok()),
+    );
+    await call({ branch: "acme/api" });
+    const executed = (await entries(log)).find((e) => e.outcome === "executed");
+    expect(executed?.detail).toEqual({
+      target: { kind: "repo", value: "acme/api" },
+      preState: { captureFailed: "ref service unavailable" },
+    });
+  });
+
+  test("a mutation that throws a non-Error is audited as failed and still rejects", async () => {
+    const log = await tempAuditPath();
+    const call = registered(
+      log,
+      () => Promise.resolve({ sha: "abc" }),
+      () => Promise.reject("remote said no"),
+    );
+    await expect(call({ branch: "acme/api" })).rejects.toBe("remote said no");
+    const all = await entries(log);
+    expect(all.map((e) => e.outcome)).toEqual(["requested", "accepted", "failed"]);
+    expect(all[2]?.detail).toEqual({
+      target: { kind: "repo", value: "acme/api" },
+      preState: { sha: "abc" },
+      error: "remote said no",
+    });
+  });
+
+  test("a write whose audit entry cannot be written is never put to the human, and never runs", async () => {
+    // The durable log is the operator's record of every write. If its first entry cannot land —
+    // here the log's directory does not exist — the write must not go ahead unrecorded.
+    let prompted = 0;
+    let mutated = 0;
+    const srv = serverWith(() => {
+      prompted += 1;
+      return Promise.resolve({ action: "accept", content: { confirm: true } });
+    });
+    const call = registerAndGet(
+      srv,
+      async () => {
+        mutated += 1;
+        return ok();
+      },
+      { auditLog: join(dirname(await tempAuditPath()), "missing", "audit.jsonl") },
+    );
+    await expect(call({ branch: "acme/api" })).rejects.toThrow(/ENOENT/);
+    expect(prompted).toBe(0);
+    expect(mutated).toBe(0);
+  });
+
+  test("each record is in the durable log before the client is told of it", async () => {
+    // The client channel is live now that write connectors declare MCP `logging`, and a send to a
+    // client that has gone away can be the last thing the process does. So the durable append
+    // comes first, and a notification never precedes the line it reports.
+    const log = await tempAuditPath();
+    const seen: { outcome: string; lastLogged: string | undefined }[] = [];
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    srv.sendLoggingMessage = async (p) => {
+      const lines = (await readFile(log, "utf8").catch(() => "")).trimEnd().split("\n");
+      const last = lines.at(-1);
+      seen.push({
+        outcome: (p.data as { outcome: string }).outcome,
+        lastLogged:
+          last === undefined || last === ""
+            ? undefined
+            : (JSON.parse(last) as { entry: { outcome: string } }).entry.outcome,
+      });
+    };
+    const call = registerAndGet(srv, async () => ok(), { auditLog: log });
+    await call({ branch: "acme/api" });
+    expect(seen).toEqual(
+      ["requested", "accepted", "executed"].map((o) => ({ outcome: o, lastLogged: o })),
+    );
+  });
+
+  test("a client that has gone away cannot keep a write's records out of the durable log", async () => {
+    // Every send rejects, as one does once the transport is closed. The write still runs, and its
+    // records all land: the client channel is best effort, the durable log is not.
+    const log = await tempAuditPath();
+    let mutated = 0;
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    srv.sendLoggingMessage = () => Promise.reject(new Error("Not connected"));
+    const call = registerAndGet(
+      srv,
+      async () => {
+        mutated += 1;
+        return ok();
+      },
+      { auditLog: log },
+    );
+    await call({ branch: "acme/api" });
+    expect(mutated).toBe(1);
+    const outcomes = (await readFile(log, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((l) => (JSON.parse(l) as { entry: { outcome: string } }).entry.outcome);
+    expect(outcomes).toEqual(["requested", "accepted", "executed"]);
+  });
+
+  test("a write that ran is not recorded as failed when recording that it ran fails", async () => {
+    // Recording `executed` shared the mutation's `catch`, so a failure to append it was recorded
+    // as the mutation failing — of a write that had in fact run. Here the mutation itself leaves
+    // the log with a last line nothing can be linked after, so that one append fails.
+    const log = await tempAuditPath();
+    const outcomes: string[] = [];
+    let mutated = 0;
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    srv.sendLoggingMessage = (p) => {
+      outcomes.push((p.data as { outcome: string }).outcome);
+      return Promise.resolve();
+    };
+    const call = registerAndGet(
+      srv,
+      async () => {
+        mutated += 1;
+        await appendFile(log, "torn\n");
+        return ok();
+      },
+      { auditLog: log },
+    );
+    await expect(call({ branch: "acme/api" })).rejects.toThrow(
+      "github_branch_delete ran, but recording that it ran failed: ",
+    );
+    expect(mutated).toBe(1);
+    // The logging channel is told of every record attempted, after the durable log has had its
+    // turn, the one whose append failed included: `executed`, and never `failed`.
+    expect(outcomes).toEqual(["requested", "accepted", "executed"]);
+    // Nothing was appended after the line the mutation left: in particular, no `failed`.
+    const lines = (await readFile(log, "utf8")).trimEnd().split("\n");
+    expect(lines.at(-1)).toBe("torn");
+    expect(
+      lines
+        .slice(0, -1)
+        .map((l) => (JSON.parse(l) as { entry: { outcome: string } }).entry.outcome),
+    ).toEqual(["requested", "accepted"]);
+  });
+
+  test("a write that fails, and whose failure cannot be recorded, still reports its own error", async () => {
+    // A tool that threw may have changed something before it did. When recording `failed` failed
+    // as well, its error replaced the tool's, and the caller saw only that the audit log could not
+    // be written — which reads as a write that never started, and so as one safe to try again.
+    // Here the tool leaves the log with a last line nothing can be linked after, then throws.
+    const log = await tempAuditPath();
+    const outcomes: string[] = [];
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    srv.sendLoggingMessage = (p) => {
+      outcomes.push((p.data as { outcome: string }).outcome);
+      return Promise.resolve();
+    };
+    const toolError = new Error("the branch was deleted, but the follow-up comment failed");
+    const call = registerAndGet(
+      srv,
+      async () => {
+        await appendFile(log, "torn\n");
+        throw toolError;
+      },
+      { auditLog: log },
+    );
+    let thrown: unknown;
+    await call({ branch: "acme/api" }).catch((e: unknown) => {
+      thrown = e;
+    });
+    expect(thrown).toBeInstanceOf(Error);
+    const { message, cause } = thrown as Error;
+    expect(message).toStartWith(
+      "github_branch_delete failed: the branch was deleted, but the follow-up comment failed. " +
+        "Recording that failure also failed: ",
+    );
+    expect(message).toContain("is not a chained entry");
+    expect(cause).toBe(toolError);
+    // The failure was attempted, and nothing landed after the line the tool left.
+    expect(outcomes).toEqual(["requested", "accepted", "failed"]);
+    expect((await readFile(log, "utf8")).trimEnd().split("\n").at(-1)).toBe("torn");
+  });
+
+  test("a handshake with nothing queued tells the client nothing changed", () => {
+    // The client is told to re-read its tool list only when write tools were actually added.
+    let listChanged = 0;
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    srv.sendToolListChanged = () => {
+      listChanged += 1;
+    };
+    process.env["NIMBUS_MCP_TEST_WRITE_SCOPE"] = "repo:acme/api";
+    createWriteToolRegistrar(srv, {
+      connector: "github",
+      scopeEnv: "NIMBUS_MCP_TEST_WRITE_SCOPE",
+      scopeKinds: ["repo"],
+    });
+    srv.handshake();
+    expect(listChanged).toBe(0);
+  });
+});
+
+describe("NIMBUS_MCP_WRITE_BUDGET at the registrar", () => {
+  beforeEach(() => {
+    resetConnectorModeForTests();
+    setConnectorMode("standalone");
+  });
+  afterEach(() => {
+    resetConnectorModeForTests();
+  });
+
+  /** Approved writes attempted in every case: more than the default, so an uncapped run shows. */
+  const ATTEMPTS = 25;
+
+  type BudgetRun =
+    | { readonly startup: "ok"; readonly executed: number }
+    | { readonly startup: "refused"; readonly executed: 0; readonly error: string };
+
+  /**
+   * Start a standalone registrar with the budget variable set to `raw` (removed when undefined),
+   * make `ATTEMPTS` approved calls to one write tool, one after another, and count the ones that
+   * reached the mutation. A registrar that refuses to start has allowed none.
+   */
+  async function runUnderBudget(raw: string | undefined): Promise<BudgetRun> {
+    if (raw === undefined) delete process.env[WRITE_BUDGET_ENV];
+    else process.env[WRITE_BUDGET_ENV] = raw;
+    process.env["NIMBUS_MCP_TEST_WRITE_SCOPE"] = "repo:acme/api";
+    delete process.env["NIMBUS_MCP_AUDIT_LOG"];
+
+    const srv = serverWith(() => Promise.resolve({ action: "accept", content: { confirm: true } }));
+    let reg: WriteToolRegistrar;
+    try {
+      reg = createWriteToolRegistrar(srv, {
+        connector: "github",
+        scopeEnv: "NIMBUS_MCP_TEST_WRITE_SCOPE",
+        scopeKinds: ["repo"],
+      });
+    } catch (e) {
+      return { startup: "refused", executed: 0, error: e instanceof Error ? e.message : String(e) };
+    }
+    let executed = 0;
+    reg("github_branch_delete", cfgFor(), "Delete a branch.", schema, async () => {
+      executed += 1;
+      return ok();
+    });
+    srv.handshake();
+    const cb = srv.captured;
+    if (cb === undefined) throw new Error("tool was not registered");
+    for (let i = 0; i < ATTEMPTS; i += 1) {
+      await cb({ branch: "acme/api" });
+    }
+    return { startup: "ok", executed };
+  }
+
+  test("unset allows exactly the default", async () => {
+    expect(await runUnderBudget(undefined)).toEqual({
+      startup: "ok",
+      executed: DEFAULT_WRITE_BUDGET,
+    });
+  });
+
+  test("an empty or whitespace-only value refuses to start — never the default", async () => {
+    // Read with `Number()`, a blank budget allowed no writes at all. Read as unset, it would allow
+    // the default ten; the registrar must refuse it instead, so it still allows none.
+    for (const raw of ["", "  "]) {
+      expect(await runUnderBudget(raw)).toEqual({
+        startup: "refused",
+        executed: 0,
+        error: expect.stringContaining(WRITE_BUDGET_ENV),
+      });
+    }
+  });
+
+  test.each([
+    ["0", 0],
+    ["3", 3],
+    [" 3 ", 3],
+    ["25", 25],
+  ])("%p allows %d", async (raw, n) => {
+    expect(await runUnderBudget(raw)).toEqual({ startup: "ok", executed: n });
+  });
+
+  // `abc`, `ten` and `Infinity` are the values measured allowing all 25 of 25 approved argocd
+  // syncs when the budget was read with `Number()`; the rest ran under a cap nobody wrote. The two
+  // digits from other scripts are ones `Number()` reads as NaN, should the parser ever let one by.
+  test.each([
+    "abc",
+    "ten",
+    "Infinity",
+    "NaN",
+    "-1",
+    "1.5",
+    "1e3",
+    "0x10",
+    "9007199254740992",
+    "1e309",
+    String.fromCodePoint(0x0665),
+    String.fromCodePoint(0xff15),
+  ])(
+    "%p cannot allow more writes than the default: the registrar refuses to start",
+    async (raw) => {
+      const run = await runUnderBudget(raw);
+      // The property itself, independent of how it is delivered...
+      expect(run.executed).toBeLessThanOrEqual(DEFAULT_WRITE_BUDGET);
+      // ...and the delivery: the connector stops at startup with an error naming the variable.
+      expect(run).toEqual({
+        startup: "refused",
+        executed: 0,
+        error: expect.stringContaining(WRITE_BUDGET_ENV),
+      });
+    },
+  );
 });

@@ -1,6 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 
 import {
+  childEnvironment,
   detectBunSpawn,
   nimbusSpawn,
   selectSpawnImpl,
@@ -16,7 +20,18 @@ const IMPLS = [
   ["spawnViaNode", spawnViaNode],
 ] as const;
 
+const NUL = String.fromCharCode(0);
+
 describe.each(IMPLS)("%s", (_label, nimbusSpawn) => {
+  test("an argument no process can be given resolves as a failure, never rejects", async () => {
+    // A NUL byte cannot be passed to a child at all, so the spawn API THROWS on it, where a missing
+    // binary fails as an event. Node's spawn threw out of the promise executor, and the promise
+    // rejected: the one outcome this contract rules out.
+    const r = await nimbusSpawn([process.execPath, "-e", "1", `a${NUL}b`], {});
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("null bytes");
+  });
+
   test("captures stdout and a zero exit", async () => {
     const r = await nimbusSpawn([process.execPath, "-e", "console.log('hi')"], {});
     expect(r.code).toBe(0);
@@ -72,6 +87,18 @@ describe.each(IMPLS)("%s", (_label, nimbusSpawn) => {
     // U+FFFD REPLACEMENT CHARACTER is what per-chunk decoding produces at a split boundary.
     expect(r.stdout).not.toContain("�");
   });
+
+  test("a child killed by a signal resolves as a numbered failure, never a null code", async () => {
+    // On Linux and macOS `child_process` reports a signalled child's code as null, and only the
+    // `?? 1` turns that into the number the contract promises; Bun reports 128 + the signal there.
+    // Windows has no signals to deliver, so the kill is a plain exit there and the code is 1.
+    const r = await nimbusSpawn(
+      [process.execPath, "-e", "process.kill(process.pid, 'SIGKILL')"],
+      {},
+    );
+    expect(r.code).toBeNumber();
+    expect(r.code).not.toBe(0);
+  });
 });
 
 describe("runtime selection", () => {
@@ -106,3 +133,159 @@ describe("runtime selection", () => {
     expect(r.stdout.trim()).toBe("via-default");
   });
 });
+
+/**
+ * The real thing, end to end: a `.cmd` on PATH, spawned by name and by path through every
+ * implementation, the way `az` and `gcloud` are on Windows. Each hostile argument here was run
+ * through the same shim with the refusal removed, and did what its label says — an injected
+ * `echo` ran, or the variable's value reached the batch file — so the refusal is what stops it.
+ *
+ * The benign case runs first for every implementation and name form, and is what keeps the
+ * refusals from passing vacuously: it proves this spawn really does reach a batch file, through
+ * this PATH, from this runtime. Were the shim never found, every refusal would still "pass".
+ */
+describe.skipIf(process.platform !== "win32")(
+  "a CLI that starts a Windows batch file (skipped off Windows: only there is a spawned program's command line parsed again, by cmd.exe)",
+  () => {
+    const name = `nimbus-batch-shim-${String(process.pid)}`;
+    let dir = "";
+    let env: Record<string, string> = {};
+
+    beforeAll(() => {
+      dir = mkdtempSync(join(tmpdir(), "nimbus-batch-shim-"));
+      // The shape of the real az.cmd — the CLI runs inside a parenthesised block — with delayed
+      // expansion on, as a batch wrapper may turn it on.
+      writeFileSync(
+        join(dir, `${name}.cmd`),
+        [
+          "@echo off",
+          "setlocal EnableDelayedExpansion",
+          'if exist "%~f0" (',
+          "  echo SHIM-RAN:[%*]",
+          ")",
+          "",
+        ].join("\r\n"),
+      );
+      // Bun resolves a bare name against a variable spelled PATH, and cmd.exe against the first
+      // spelling it meets, which on a Windows-launched process is Path: give every spelling the
+      // same value, or the two would look in different places.
+      const searchPath = `${dir}${delimiter}${process.env["PATH"] ?? ""}`;
+      env = { NIMBUS_SHIM_SECRET: "leaked-secret", PATH: searchPath };
+      for (const key of Object.keys(process.env)) {
+        if (key.toLowerCase() === "path") {
+          env[key] = searchPath;
+        }
+      }
+    });
+
+    afterAll(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const HOSTILE = [
+      ["a command separator", "x&echo,NIMBUS-INJECTED"],
+      ["a pipe", "x|echo,NIMBUS-INJECTED"],
+      ["a quote ending the quoting the runtime added", 'q"&echo NIMBUS-INJECTED&"'],
+      ["%-expansion of an environment variable", "%NIMBUS_SHIM_SECRET%"],
+      ["%-expansion inside an argument the runtime quotes", "a %NIMBUS_SHIM_SECRET% b"],
+      ["!-expansion under delayed expansion", "!NIMBUS_SHIM_SECRET!"],
+      ["a parenthesis ending the batch file's block", "rg(prod)"],
+      ["an output redirection", "x>NUL"],
+      ["an input redirection", "x<NUL"],
+      ["a caret escape", "a^b"],
+      ["a line break", `x${String.fromCharCode(0x0a)}echo NIMBUS-INJECTED`],
+    ] as const;
+
+    for (const [label, impl] of IMPLS) {
+      for (const form of ["by name, through PATH", "by path"] as const) {
+        const command = (): string => (form === "by path" ? join(dir, `${name}.cmd`) : name);
+
+        test(`${label}, ${form}: an ordinary argument reaches the batch file`, async () => {
+          const r = await impl([command(), "webapp", "list", "benign-value"], env);
+          expect({ code: r.code, stdout: r.stdout.trim(), stderr: r.stderr }).toEqual({
+            code: 0,
+            stdout: "SHIM-RAN:[webapp list benign-value]",
+            stderr: "",
+          });
+        });
+
+        test.each(HOSTILE)(
+          `${label}, ${form}: refuses %s before cmd.exe sees it`,
+          async (_what, value) => {
+            const r = await impl([command(), "webapp", value], env);
+            expect(r.code).toBe(1);
+            expect(r.stderr).toContain(`refused to run ${JSON.stringify(command())}`);
+            expect(r.stderr).toContain("Nothing was run.");
+            // Nothing started: not the batch file, and so not whatever cmd.exe would have run.
+            expect(r.stdout).toBe("");
+            expect(r.stderr).not.toContain("NIMBUS-INJECTED");
+            expect(r.stderr).not.toContain("leaked-secret");
+          },
+        );
+      }
+    }
+  },
+);
+
+describe("childEnvironment", () => {
+  test("off Windows, merges the two as written, since names are case-sensitive there", () => {
+    expect(childEnvironment({ Path: "a", HOME: "/h" }, { PATH: "b" }, "linux")).toEqual({
+      Path: "a",
+      HOME: "/h",
+      PATH: "b",
+    });
+  });
+
+  test("on Windows, spells the search path PATH, whatever spelling it arrived in", () => {
+    expect(childEnvironment({ Path: "a", Foo: "1" }, {}, "win32")).toEqual({ PATH: "a", Foo: "1" });
+    expect(childEnvironment({}, { path: "c" }, "win32")).toEqual({ PATH: "c" });
+  });
+
+  test("on Windows, an override replaces the base's variable whatever either spells it", () => {
+    expect(
+      childEnvironment(
+        { Path: "a", SystemRoot: "C:/Windows", TEMP: "t" },
+        { PATH: "b", SYSTEMROOT: "D:/W" },
+        "win32",
+      ),
+    ).toEqual({ PATH: "b", SYSTEMROOT: "D:/W", TEMP: "t" });
+  });
+});
+
+/**
+ * A bare batch-file name, found through a search path spelled `Path`, as a process started from
+ * PowerShell, cmd or Explorer spells it. Bun resolves a bare name only through `PATH`, so with
+ * `Path` alone `az` and `gcloud` did not start at all. The `PATH` case runs first, so the others
+ * cannot pass for a shim that no spelling would find.
+ */
+describe.skipIf(process.platform !== "win32")(
+  "a batch file found through Path (skipped off Windows: only there are variable names case-insensitive)",
+  () => {
+    const name = `nimbus-path-shim-${String(process.pid)}`;
+    let searchPath = "";
+    let dir = "";
+
+    beforeAll(() => {
+      dir = mkdtempSync(join(tmpdir(), "nimbus-path-shim-"));
+      writeFileSync(join(dir, `${name}.cmd`), ["@echo off", "echo SHIM-RAN:[%*]", ""].join("\r\n"));
+      searchPath = `${dir}${delimiter}${process.env["PATH"] ?? ""}`;
+    });
+
+    afterAll(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    for (const [label, impl] of IMPLS) {
+      test(`${label}: starts it whichever way the variable is spelled`, async () => {
+        for (const key of ["PATH", "Path", "path"]) {
+          const r = await impl([name, "ok"], { [key]: searchPath });
+          expect({ key, code: r.code, stdout: r.stdout.trim() }).toEqual({
+            key,
+            code: 0,
+            stdout: "SHIM-RAN:[ok]",
+          });
+        }
+      });
+    }
+  },
+);

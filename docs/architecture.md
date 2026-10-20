@@ -35,7 +35,8 @@ was first extracted from the Nimbus monorepo, which put **107 entries** at the t
 
 Everything here publishes as a single npm package, `@nimbus-dev/connectors`. The alternative — a
 package per connector — was rejected because it means 94 releases per change to `shared/`, and it
-forces `shared/` to become a versioned dependency that 190 files currently import by relative path.
+forces `shared/` to become a versioned dependency that 212 shipped connector source files currently
+import by relative path.
 
 The per-connector `package.json` files are kept for their metadata but are **not published** and are
 not workspace members. Their `dependencies` are informational; the real dependency set is declared
@@ -61,16 +62,19 @@ carried a copy of the same imapflow client, and only one of the three closed the
 the mailbox lock failed.
 
 If a connector genuinely needs to register from `server.ts`, guard the bootstrap behind
-`if (import.meta.main)` and export the registrar. Ten connectors do this and are covered the same
-way.
+`if (import.meta.main)` and export the registrar plus `startConnector()`. The guard is false under
+an import, so the gateway's bundled registry and the launcher start such a connector by calling
+`startConnector()` — without it the import starts nothing and the process exits 0 in silence.
+Ten connectors do this and are covered the same way.
 
-Three layers sit under it:
+Four layers sit under it:
 
 **`shared/` — the kits.** Tool registration (`mcp-tool-kit.ts`, `rest-tool-kit.ts`,
-`mcp-search-tool.ts`, `collection-tool-kit.ts`), transport helpers (`fetch-bearer-json.ts`,
-`env-json-api.ts`, `atlassian-json-fetch.ts`, `join-api-path.ts`, `run-cli-json.ts`,
-`cli-json-kit.ts`, `imapflow-adapter.ts`), and the search-filter primitives. A connector composes
-these rather than hand-rolling HTTP and tool plumbing.
+`mcp-search-tool.ts`, `cursor-list-tool.ts`, `collection-tool-kit.ts`), transport helpers
+(`fetch-bearer-json.ts`, `fetch-json-text.ts`, `env-json-api.ts`, `atlassian-json-fetch.ts`,
+`join-api-path.ts`, `run-cli-json.ts`, `cli-json-kit.ts`, `imapflow-adapter.ts`, `graphql-json.ts`,
+`github-rest.ts`), and the search-filter primitives. A connector composes these rather than
+hand-rolling HTTP and tool plumbing.
 
 Four of these exist because the hand-rolled versions had multiplied:
 
@@ -78,7 +82,7 @@ Four of these exist because the hand-rolled versions had multiplied:
 | --- | --- |
 | `env-json-api.ts` | The `apiToken()` / `authHeader()` / `<x>Get(path)` triple, written out identically in 31 connectors. |
 | `collection-tool-kit.ts` | The `<prefix>_list` / `_get` / `_search` triple over one collection. |
-| `cli-json-kit.ts` | The spawn-CLI-and-parse-JSON wrapper, plus the `cliArg` argv-injection guard, in the five CLI-backed connectors. |
+| `cli-json-kit.ts` | The spawn-CLI-and-parse-JSON wrapper, plus the `cliArg` argv-injection guard, in the five CLI-backed connectors. Every caller-supplied value that reaches a CLI, in all eleven connectors that spawn one, now passes one of its argument schemas. |
 | `imapflow-adapter.ts` | The imapflow client and nodemailer mailer, one copy each in `imap`, `protonmail` and `apple`. |
 
 A kit is worth adding when the copies have started to diverge, not merely when there are several of
@@ -88,14 +92,55 @@ five hand-written copies is one that can be strengthened in four of them.
 **`shared/consent-kit.ts` — the write path.** Every mutating tool is registered through
 `createWriteToolRegistrar`, never with the raw MCP registration call. That registrar is what
 enforces consent, the write-scope allow-list and the mutation budget, and it is why those properties
-hold regardless of how a connector is written. `shared/write-scope.ts` and `shared/audit-chain.ts`
-back it.
+hold regardless of how a connector is written. `shared/write-scope.ts`, `shared/write-budget.ts` and
+`shared/audit-chain.ts` back it.
+
+The audit chain links each entry to the line before it, so it is only as good as its appends are
+ordered, and appends do arrive together: the SDK runs tool calls concurrently, and every connector a
+client starts may share one `NIMBUS_MCP_AUDIT_LOG`. `audit-chain.ts` therefore serialises them
+twice — per log within a process, and across processes through an `O_EXCL` lock file beside the
+log, its symlinks resolved — and fails closed: an append that cannot take the lock, read the log or
+link to its last line writes nothing, and the registrar runs no write whose `requested` and
+`accepted` entries did not land. A lock records its holder's pid and the pid space it belongs to —
+on Linux the kernel's boot id and the PID namespace, elsewhere the platform — and a holder is
+judged gone from its pid only within that pid space; any other lock is judged by its age. The
+lock's file operations can be injected through its options, which is how the tests reproduce the
+failures WSL's `/mnt` drives produce. [Configuration](./configuration.md#the-audit-log) has the
+operator's side, and the lock's bounds.
 
 **`shared/connector-mode.ts` — gateway versus standalone.** A connector behaves differently when the
 Nimbus gateway hosts it (the gateway owns consent) than when it runs standalone (the client owns
 consent). The mode is set once, by the entry point. `setConnectorMode` may only be named by
 `shared/connector-mode.ts` itself — enforced by `scripts/check-connector-consent.ts`, because a
 second caller could re-gate a connector mid-process.
+
+**`shared/nimbus-spawn.ts` — the spawn path.** The only file in the package that starts a process,
+held to that by `scripts/spawn-chokepoint.test.ts`, which parses every shipped source file with
+Bun's transpiler and fails any other that imports `child_process`, `cluster`, `bun` or `bun:ffi` in
+any form, or refers to the `Bun` global at all. The eleven connectors that drive a CLI reach it
+directly or through `run-cli-json.ts` and `cli-json-kit.ts`, and a tool argument is checked twice on
+the way:
+
+- **At the tool's schema.** Every caller-supplied value that reaches a CLI passes one of
+  `cli-json-kit.ts`'s argument schemas: `cliArg` refuses a value the CLI would read as a flag, a
+  control character and anything over 1024 characters; `awsCliArg` and `azCliArg` add the values
+  `aws` and `az` would replace by a file's contents (`file://`, `fileb://`, `http(s)://` and `@=`;
+  a leading `@` and `=@`). A document is never an argument: a CloudFormation template reaches
+  `aws` as a file the tool writes and removes. The refusal is the schema's, so it comes before a
+  consent prompt, a scope check or a spawn. `scripts/cli-argument-guards.test.ts` sweeps
+  every tool of every connector that spawns, learns which argument reaches which CLI, and fails
+  one whose schema lets through a value that CLI would misread.
+- **At the spawn.** On Windows `az` and `gcloud` are batch files, and `cmd.exe` parses a batch
+  file's command line a second time, so `windows-batch-args.ts` refuses an argument holding
+  `% ! " & | < > ^ ( )` or a control character whenever the program may be a `.cmd` or `.bat`.
+  That is decided by looking the name up on `PATH` the way Bun does, never from the name alone,
+  so the file found first decides: an `aws.exe` found before any `aws.cmd` is unaffected. Where
+  Bun could change without notice the lookup leans toward refusing — it reads `PATH` in every
+  spelling, though Bun reads only `PATH`, and a batch file beside an `.exe` in the first directory
+  holding the name counts — and a Windows-only test holds it to what Bun's own lookup does. The
+  spawn also respells the search path `PATH` on Windows, where a variable's name is
+  case-insensitive: under the `Path` a PowerShell-launched process has, Bun found no `az.cmd` and
+  the call failed with ENOENT.
 
 ## The gates
 
@@ -104,14 +149,18 @@ All run by CI on Ubuntu, macOS and Windows:
 | Command | What it establishes |
 | --- | --- |
 | `bun run lint` | Biome formatting and lint rules, including `noExplicitAny`. |
-| `bun run typecheck` | One `tsc` pass over all 94 connectors plus `shared/`, `standalone/` and `scripts/`. |
+| `bun run typecheck` | One `tsc` pass over all 94 connectors (their `src/` and any `scripts/`) plus `shared/`, `standalone/` and `scripts/`. Test files (`*.test.ts`) are excluded, so no gate type-checks them. |
 | `bun run audit:connector-consent` | No connector declares a mutating tool without routing it through the consent kit, and nothing outside `shared/connector-mode.ts` names the mode setter. |
 | `bun run audit:connector-deps` | No connector pulls in a dependency the bundled gateway binary cannot carry. |
-| `bun run audit:connector-entrypoints` | Every connector directory has the entry point that defines it. |
+| `bun run audit:connector-entrypoints` | Every `server.ts` that guards its startup with `import.meta.main` exports `startConnector()`, so the bundled registry can start it. |
 | `bun run audit:tool-names` | Every `*_TOOL_NAMES` export matches what its connector actually registers. `bun run sync:tool-names` rewrites the stale ones. |
-| `bun test` | The suite, 2100+ tests. |
+| `bun test` | The suite, 3600+ tests. |
 
 `bun run check` runs them all in order.
+
+`bun run test:sandbox` is deliberately not among them. It runs the 79 per-connector
+`test/sandbox.test.ts` files, which open real connections to each connector's first declared
+network host, so it is an explicit opt-in and runs in no workflow.
 
 ### The connector contract
 
@@ -128,6 +177,11 @@ properties no per-connector test was checking:
 
 Arguments come from `scripts/tool-arg-fixture.ts`, which derives the smallest object each tool's own
 Zod schema accepts, so a schema change cannot silently leave a fixture stale.
+
+The entry points are covered the same way by `scripts/connector-boot.test.ts`, which boots every
+`server.ts` as the gateway does — in gateway mode, with only stdin and stdout swapped for in-memory
+streams — and asserts over MCP that it is named `nimbus-<id>` and serves exactly the tools its
+registrar registers.
 
 The consent audit is the structural one. It identifies a connector by asking whether the directory
 has `src/server.ts`, not by skipping known non-connector names — a blocklist had already produced a

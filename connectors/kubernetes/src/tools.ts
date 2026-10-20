@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { cliArg } from "../../../shared/cli-json-kit.ts";
 import type { ConsentServer } from "../../../shared/consent-kit.ts";
 import { createWriteToolRegistrar } from "../../../shared/consent-kit.ts";
 import {
@@ -6,7 +7,7 @@ import {
   createZodToolRegistrar,
   mcpJsonResult as jsonResult,
 } from "../../../shared/mcp-tool-kit.ts";
-import { runCliJson, runCliOk } from "../../../shared/run-cli-json.ts";
+import { runCliJsonThrowing, runCliOkThrowing } from "../../../shared/run-cli-json.ts";
 
 function requireKubeconfigPath(): string {
   const p = process.env["KUBECONFIG"]?.trim();
@@ -31,14 +32,10 @@ function kubeEnv(): Record<string, string | undefined> {
 
 async function kubectlJson(rest: string[]): Promise<unknown> {
   const cmd = [...kubectlBase(), ...rest, "-o", "json"];
-  const r = await runCliJson(cmd, kubeEnv());
-  if (!r.ok) {
-    throw new Error(r.message);
-  }
-  return r.data;
+  return runCliJsonThrowing(cmd, kubeEnv());
 }
 
-const optionalNamespaceSchema = z.object({ namespace: z.string().min(1).optional() });
+const optionalNamespaceSchema = z.object({ namespace: cliArg.optional() });
 
 async function k8sListNamespacedResource(p: { namespace?: string | undefined }, resource: string) {
   const ns = p.namespace ?? "default";
@@ -96,17 +93,14 @@ export function registerKubernetesTools(
     },
     "Restart a rollout (e.g. deployment).",
     z.object({
-      namespace: z.string().min(1).optional(),
-      resourceType: z.string().min(1),
-      name: z.string().min(1),
+      namespace: cliArg.optional(),
+      resourceType: cliArg,
+      name: cliArg,
     }),
     async (p) => {
       const ns = p.namespace ?? "default";
       const cmd = [...kubectlBase(), "rollout", "restart", p.resourceType, p.name, "-n", ns];
-      const r = await runCliOk(cmd, kubeEnv());
-      if (!r.ok) {
-        throw new Error(r.message);
-      }
+      await runCliOkThrowing(cmd, kubeEnv());
       return jsonResult({ ok: true });
     },
   );
@@ -115,23 +109,22 @@ export function registerKubernetesTools(
     "k8s_pod_delete",
     {
       mutates: "kubernetes.pod.delete",
-      // A deleted pod is not restorable; its identity is all that remains to record.
+      // A deleted pod is not restorable; its identity is all that remains to record — including
+      // the namespace the delete defaulted to, without which the record cannot say where it was.
       recoverable: false,
-      capturePreState: (p) => Promise.resolve({ namespace: p.namespace, podName: p.podName }),
+      capturePreState: (p) =>
+        Promise.resolve({ namespace: p.namespace ?? "default", podName: p.podName }),
       scopeTargetOf: (p) => ({ kind: "namespace", value: p.namespace ?? "default" }),
     },
     "Delete a pod.",
     z.object({
-      namespace: z.string().min(1).optional(),
-      podName: z.string().min(1),
+      namespace: cliArg.optional(),
+      podName: cliArg,
     }),
     async (p) => {
       const ns = p.namespace ?? "default";
       const cmd = [...kubectlBase(), "delete", "pod", p.podName, "-n", ns];
-      const r = await runCliOk(cmd, kubeEnv());
-      if (!r.ok) {
-        throw new Error(r.message);
-      }
+      await runCliOkThrowing(cmd, kubeEnv());
       return jsonResult({ ok: true });
     },
   );
@@ -145,8 +138,8 @@ export function registerKubernetesTools(
     },
     "Scale a deployment.",
     z.object({
-      namespace: z.string().min(1).optional(),
-      deploymentName: z.string().min(1),
+      namespace: cliArg.optional(),
+      deploymentName: cliArg,
       replicas: z.number().int().min(0),
     }),
     async (p) => {
@@ -160,10 +153,7 @@ export function registerKubernetesTools(
         ns,
         `--replicas=${String(p.replicas)}`,
       ];
-      const r = await runCliOk(cmd, kubeEnv());
-      if (!r.ok) {
-        throw new Error(r.message);
-      }
+      await runCliOkThrowing(cmd, kubeEnv());
       return jsonResult({ ok: true });
     },
   );

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { cliArg, gcloudEnv } from "../../../shared/cli-json-kit.ts";
 import type { ConsentServer } from "../../../shared/consent-kit.ts";
 import { createWriteToolRegistrar } from "../../../shared/consent-kit.ts";
 import {
@@ -6,24 +7,11 @@ import {
   createZodToolRegistrar,
   mcpJsonResult as jsonResult,
 } from "../../../shared/mcp-tool-kit.ts";
-import { runCliJson, runCliOk } from "../../../shared/run-cli-json.ts";
-
-function gcloudEnv(): Record<string, string | undefined> {
-  const e = { ...process.env } as Record<string, string | undefined>;
-  const cf = process.env["GOOGLE_APPLICATION_CREDENTIALS"]?.trim();
-  if (cf !== undefined && cf !== "") {
-    e["GOOGLE_APPLICATION_CREDENTIALS"] = cf;
-  }
-  return e;
-}
+import { runCliJsonThrowing, runCliOkThrowing } from "../../../shared/run-cli-json.ts";
 
 async function gcloudJson(args: string[]): Promise<unknown> {
   const cmd = ["gcloud", ...args, "--format", "json"];
-  const r = await runCliJson(cmd, gcloudEnv());
-  if (!r.ok) {
-    throw new Error(r.message);
-  }
-  return r.data ?? {};
+  return (await runCliJsonThrowing(cmd, gcloudEnv())) ?? {};
 }
 
 /** Tool names exposed by this connector — for contract/introspection tests. */
@@ -52,7 +40,7 @@ export function registerGcpTools(
   reg(
     "gcp_cloud_run_service_list",
     "List Cloud Run services in a region.",
-    z.object({ projectId: z.string().min(1), region: z.string().min(1) }),
+    z.object({ projectId: cliArg, region: cliArg }),
     async (p) =>
       jsonResult(
         await gcloudJson([
@@ -74,13 +62,13 @@ export function registerGcpTools(
     },
     "Deploy a container image to Cloud Run.",
     z.object({
-      projectId: z.string().min(1),
-      region: z.string().min(1),
-      service: z.string().min(1),
-      image: z.string().min(1),
+      projectId: cliArg,
+      region: cliArg,
+      service: cliArg,
+      image: cliArg,
     }),
     async (p) => {
-      const r = await runCliOk(
+      await runCliOkThrowing(
         [
           "gcloud",
           "run",
@@ -93,9 +81,6 @@ export function registerGcpTools(
         ],
         gcloudEnv(),
       );
-      if (!r.ok) {
-        throw new Error(r.message);
-      }
       return jsonResult({ ok: true });
     },
   );
@@ -109,14 +94,14 @@ export function registerGcpTools(
     },
     "Restart a GKE deployment rollout via kubectl (uses current cluster credentials).",
     z.object({
-      projectId: z.string().min(1),
-      location: z.string().min(1),
-      cluster: z.string().min(1),
-      namespace: z.string().min(1),
-      deployment: z.string().min(1),
+      projectId: cliArg,
+      location: cliArg,
+      cluster: cliArg,
+      namespace: cliArg,
+      deployment: cliArg,
     }),
     async (p) => {
-      const getCreds = await runCliOk(
+      await runCliOkThrowing(
         [
           "gcloud",
           "container",
@@ -128,16 +113,10 @@ export function registerGcpTools(
         ],
         gcloudEnv(),
       );
-      if (!getCreds.ok) {
-        throw new Error(getCreds.message);
-      }
-      const r = await runCliOk(
+      await runCliOkThrowing(
         ["kubectl", "rollout", "restart", "deployment", p.deployment, "-n", p.namespace],
         gcloudEnv(),
       );
-      if (!r.ok) {
-        throw new Error(r.message);
-      }
       return jsonResult({ ok: true });
     },
   );

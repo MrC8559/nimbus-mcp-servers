@@ -1,6 +1,6 @@
 {
   "name": "nimbus-mcp-readwise",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -8,12 +8,13 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/",
     "test": "bun test",
+    "build:extension": "bun scripts/build-extension.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
-    "@nimbus-dev/sdk": "^1.19.0",
-    "zod": "^4.4.2"
+    "@modelcontextprotocol/sdk": "1.32.0",
+    "@nimbus-dev/sdk": "^2.1.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/bun": "latest"

@@ -1,20 +1,21 @@
 import { z } from "zod";
-import { asArray, createCliJsonRunner, isRecord, strField } from "../../../shared/cli-json-kit.ts";
+import {
+  asArray,
+  awsCliArg,
+  createCliJsonRunner,
+  isRecord,
+  strField,
+} from "../../../shared/cli-json-kit.ts";
 import { mcpJsonResult as jsonResult } from "../../../shared/mcp-tool-kit.ts";
 import { nimbusSpawn } from "../../../shared/nimbus-spawn.ts";
 import type { ZodToolRegistrar } from "../../../shared/run-read-only-mcp-connector.ts";
-import { isSafeCliArg } from "../../../shared/safe-cli-arg.ts";
 
 /**
- * A SageMaker model name passed as a value to the `aws sagemaker` CLI. Rejected
- * at the schema boundary if it begins with `-` (argv flag smuggling) or contains
- * control characters. Exported so the contract test can assert the guard rejects
- * a `-`-prefixed value.
+ * The argv-injection guard every SageMaker model name passes through on its way to the
+ * `aws sagemaker` CLI. Re-exported so this connector's own test can assert the guard rejects a
+ * `-`-prefixed value, and one the CLI would replace by a file's contents (`file://<path>`).
  */
-export const cliArg = z
-  .string()
-  .min(1)
-  .refine(isSafeCliArg, { message: 'must not start with "-" or contain control characters' });
+export { awsCliArg };
 
 /**
  * Amazon SageMaker (Tier-3, metadata-only) MCP tool surface. ALL tools index
@@ -64,7 +65,7 @@ export function registerSagemakerTools(reg: ZodToolRegistrar): void {
     "sagemaker_list",
     "List Amazon SageMaker models — METADATA ONLY (`aws sagemaker list-models`). Each entry carries `ModelName`, `ModelArn`, and `CreationTime`. Optionally filter by a `nameContains` substring on the model name. Never invokes an endpoint and never fetches inference / training / model-artifact data.",
     z.object({
-      nameContains: cliArg.optional(),
+      nameContains: awsCliArg.optional(),
     }),
     async (p) => {
       const args = ["list-models", "--max-results", PAGE];
@@ -79,7 +80,7 @@ export function registerSagemakerTools(reg: ZodToolRegistrar): void {
     "sagemaker_get",
     "Fetch one Amazon SageMaker model's METADATA (`aws sagemaker describe-model`). Returns the model object including `ModelName`, `ModelArn`, `PrimaryContainer` (container `Image` reference + `ModelDataUrl` S3 pointer — a URI string, NOT the model bytes), `ExecutionRoleArn`, and `CreationTime`. No inference, training, or model-artifact data is returned — registry metadata only.",
     z.object({
-      modelName: cliArg,
+      modelName: awsCliArg,
     }),
     async (p) => {
       return jsonResult(await sagemakerCli(["describe-model", "--model-name", p.modelName]));

@@ -2,10 +2,8 @@ import type { McpListResult, ZodObjectSchema } from "@nimbus-dev/sdk/connector-k
 
 import { type AuditOutcome, appendAuditEntry } from "./audit-chain.ts";
 import { getConnectorMode } from "./connector-mode.ts";
+import { createWriteBudget, parseWriteBudget, WRITE_BUDGET_ENV } from "./write-budget.ts";
 import { parseWriteScope, scopeAllows } from "./write-scope.ts";
-
-/** Mutations allowed per process lifetime when NIMBUS_MCP_WRITE_BUDGET is unset. */
-const DEFAULT_BUDGET = 10;
 
 /** The subset of the SDK's `RegisteredTool` this kit needs. */
 export type ToolHandle = { disable(): void };
@@ -61,6 +59,19 @@ export type ConsentServer = {
   sendLoggingMessage(params: { level: "info" | "warning"; data: unknown }): Promise<void>;
 };
 
+/**
+ * What a connector with write tools constructs its `McpServer` with:
+ * `new McpServer(info, { capabilities: CONSENT_SERVER_CAPABILITIES })`.
+ *
+ * The kit tells the client about every gated outcome with `notifications/message`, and the SDK
+ * sends that only for a server that declared the MCP `logging` capability. No connector did, so
+ * each notification was dropped without a word. It must be declared at construction: that is the
+ * only moment the SDK installs its `logging/setLevel` handler, and a server that declared the
+ * capability later would refuse a client setting the level. `scripts/connector-boot.test.ts`
+ * fails a connector whose manifest declares a write and whose booted server does not declare it.
+ */
+export const CONSENT_SERVER_CAPABILITIES = { logging: {} };
+
 export type WriteToolConfig<T> = {
   /** Action type this tool performs, e.g. "repo.branch.delete". Machine-readable, not prose. */
   readonly mutates: string;
@@ -82,6 +93,11 @@ export type WriteToolRegistrar = <T>(
 
 function refused(why: string): McpListResult {
   return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: why }) }] };
+}
+
+/** The message of whatever was thrown, which need not be an `Error`. */
+function messageOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 /**
@@ -172,28 +188,75 @@ export function createWriteToolRegistrar(
 
   const scope = parseWriteScope(process.env[cfg.scopeEnv], cfg.scopeKinds);
   const auditLog = process.env["NIMBUS_MCP_AUDIT_LOG"];
-  let remaining = Number(process.env["NIMBUS_MCP_WRITE_BUDGET"] ?? DEFAULT_BUDGET);
+  // Throws on a value that is not plain digits, an empty one included, as the scope parse above
+  // does on a malformed term: read with `Number()`, `abc` became NaN, which `remaining <= 0` never
+  // refused.
+  const budget = createWriteBudget(parseWriteBudget(process.env[WRITE_BUDGET_ENV]));
 
   async function record(
     tool: string,
     outcome: AuditOutcome,
     detail: Record<string, unknown>,
   ): Promise<void> {
-    // Client-visible channel: any MCP client can display or persist this.
-    await server.sendLoggingMessage({
-      level: outcome === "executed" ? "info" : "warning",
-      data: { connector: cfg.connector, tool, outcome },
-    });
-    // Durable channel: only when the operator configured a path.
-    if (auditLog !== undefined && auditLog !== "") {
-      await appendAuditEntry(auditLog, {
-        ts: new Date().toISOString(),
-        connector: cfg.connector,
-        tool,
-        outcome,
-        detail,
-      });
+    try {
+      // Durable channel first: only when the operator configured a path. An append that fails
+      // rejects, and every record before the mutation is awaited, so a write whose entry did not
+      // land never runs.
+      if (auditLog !== undefined && auditLog !== "") {
+        await appendAuditEntry(auditLog, {
+          ts: new Date().toISOString(),
+          connector: cfg.connector,
+          tool,
+          outcome,
+          detail,
+        });
+      }
+    } finally {
+      // Then the client-visible channel, told of every record attempted, one whose append failed
+      // included. It reaches the client because the connector declared the MCP `logging`
+      // capability (CONSENT_SERVER_CAPABILITIES), and a client may filter it by level. Best
+      // effort, and after the durable log: a client that has gone away mid-write must not keep the
+      // `executed` or `failed` record of a write that ran out of the log, and since the capability
+      // made this channel live, a dead pipe is where a send now fails.
+      await server
+        .sendLoggingMessage({
+          level: outcome === "executed" ? "info" : "warning",
+          data: { connector: cfg.connector, tool, outcome },
+        })
+        .catch(() => undefined);
     }
+  }
+
+  /**
+   * Take one unit of budget if any is left. Spending the last unit disables every write tool and
+   * tells the client.
+   *
+   * Nothing may be awaited between the check and the decrement, which is why both are the one
+   * synchronous call `budget.take()`. Calls run concurrently (the SDK starts each request's
+   * handler as it arrives), and with an await between the two every call in flight passed the
+   * check before any of them spent: three approved calls all mutated under a budget of one.
+   */
+  function spendOne(): boolean {
+    if (!budget.take()) return false;
+    if (!budget.hasLeft()) {
+      for (const h of handles) h.disable();
+      server.sendToolListChanged();
+    }
+    return true;
+  }
+
+  /**
+   * The refusal for a spent budget, worded the same for the client at both places it is checked.
+   * The audit reason tells them apart: `budget exhausted after approval` follows an `accepted`
+   * entry, because the budget ran out while that write's prompt was open.
+   */
+  async function budgetExhausted(
+    tool: string,
+    target: { kind: string; value: string },
+    reason: "budget exhausted" | "budget exhausted after approval",
+  ): Promise<McpListResult> {
+    await record(tool, "refused", { reason, target });
+    return refused("write budget exhausted for this session");
   }
 
   /**
@@ -269,11 +332,9 @@ export function createWriteToolRegistrar(
         return refused(`out of scope: ${target.kind}:${target.value} is not in ${cfg.scopeEnv}`);
       }
 
-      // 2. BUDGET — same reasoning: a refusal that consent cannot lift comes before consent.
-      if (remaining <= 0) {
-        await record(name, "refused", { reason: "budget exhausted", target });
-        return refused("write budget exhausted for this session");
-      }
+      // 2. BUDGET — same reasoning: a refusal that consent cannot lift comes before consent. Not
+      //    the last word on the budget, though: see step 4.
+      if (!budget.hasLeft()) return budgetExhausted(name, target, "budget exhausted");
 
       // 3. CONSENT.
       await record(name, "requested", { target, params: args });
@@ -283,7 +344,13 @@ export function createWriteToolRegistrar(
       }
       await record(name, "accepted", { target });
 
-      // 4. PRE-STATE — after approval, before the mutation, so an unrecoverable action leaves a
+      // 4. SPEND — the budget checked AGAIN, and decremented in the same synchronous step: every
+      //    call in flight passed step 2 before any of them got this far, so step 2 alone cannot
+      //    hold the cap (see `spendOne`). Spent BEFORE the mutation so a throwing one still
+      //    consumes budget — otherwise a failing destructive tool could be retried without limit.
+      if (!spendOne()) return budgetExhausted(name, target, "budget exhausted after approval");
+
+      // 5. PRE-STATE — after approval, before the mutation, so an unrecoverable action leaves a
       //    record of what it destroyed. Capture failure is NOT fatal: refusing here would turn a
       //    transient read error into a blocked action the owner already approved.
       let preState: Record<string, unknown> = {};
@@ -291,29 +358,39 @@ export function createWriteToolRegistrar(
         try {
           preState = await toolCfg.capturePreState(args);
         } catch (e) {
-          preState = { captureFailed: e instanceof Error ? e.message : String(e) };
+          preState = { captureFailed: messageOf(e) };
         }
       }
 
-      // 5. MUTATE. Decrement BEFORE the call so a throwing mutation still consumes budget —
-      //    otherwise a failing destructive tool could be retried without limit.
-      remaining -= 1;
-      if (remaining <= 0) {
-        for (const h of handles) h.disable();
-        server.sendToolListChanged();
-      }
+      // 6. MUTATE.
+      let result: McpListResult;
       try {
-        const result = await handler(args);
-        await record(name, "executed", { target, preState });
-        return result;
+        result = await handler(args);
       } catch (e) {
-        await record(name, "failed", {
-          target,
-          preState,
-          error: e instanceof Error ? e.message : String(e),
-        });
+        // A tool that threw may still have changed something first. If recording the failure fails
+        // too, the tool's own error still leads what the call reports: an audit error alone reads
+        // as a write that never started, and so as one that is safe to try again.
+        try {
+          await record(name, "failed", { target, preState, error: messageOf(e) });
+        } catch (error_) {
+          throw new Error(
+            `${name} failed: ${messageOf(e)}. Recording that failure also failed: ${messageOf(error_)}`,
+            { cause: e },
+          );
+        }
         throw e;
       }
+      // Outside the `try`: the mutation has happened, so a failure to RECORD it must not be
+      // recorded as the mutation failing, which it was when both shared one `catch`. The call still
+      // rejects, saying the write ran, so it is not taken for one that is safe to try again.
+      try {
+        await record(name, "executed", { target, preState });
+      } catch (e) {
+        throw new Error(`${name} ran, but recording that it ran failed: ${messageOf(e)}`, {
+          cause: e,
+        });
+      }
+      return result;
     };
 
     pending.push(() => {
