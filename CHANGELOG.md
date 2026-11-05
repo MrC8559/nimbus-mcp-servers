@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/nimbus-agent/nimbus-mcp-servers/compare/connectors-v0.3.0...connectors-v0.4.0) (2026-11-05)
+
+
+### Features
+
+* **connectors:** Wave-2 write tools for GitHub, GitLab, Jira, Outlook, Discord and Confluence ([#64](https://github.com/nimbus-agent/nimbus-mcp-servers/issues/64)) ([c7c35e6](https://github.com/nimbus-agent/nimbus-mcp-servers/commit/c7c35e6b6e82b0aa1fffcfc7c0a69d3673e3cd72))
+
+## [0.3.0](https://github.com/nimbus-agent/nimbus-mcp-servers/compare/connectors-v0.2.4...connectors-v0.3.0) (2026-10-20)
+
+
+### Features
+
+* **readwise:** self-contained extension package with sync ([#59](https://github.com/nimbus-agent/nimbus-mcp-servers/issues/59)) ([fcbc6a5](https://github.com/nimbus-agent/nimbus-mcp-servers/commit/fcbc6a5d6bf9f4590cd39a4350d183b72506ebd1))
+
 ## [0.2.4](https://github.com/nimbus-agent/nimbus-mcp-servers/compare/connectors-v0.2.3...connectors-v0.2.4) (2026-10-05)
 
 

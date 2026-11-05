@@ -76,6 +76,35 @@ const stateListUrl =
       setPaging(q, parsed);
     });
 
+/** `<origin>/api/graphql` for the configured REST base, with or without its `/api/v4` suffix. */
+function graphqlUrl(): string {
+  return `${apiBase().replace(/\/api\/v4$/, "")}/api/graphql`;
+}
+
+/** APPEND is the whole point: REPLACE would drop the assignees already on the issue. */
+const SET_ASSIGNEES_APPEND =
+  "mutation($projectPath: ID!, $iid: String!, $assigneeUsernames: [String!]!) {" +
+  " issueSetAssignees(input: { projectPath: $projectPath, iid: $iid," +
+  " assigneeUsernames: $assigneeUsernames, operationMode: APPEND }) { errors } }";
+
+/** The first GraphQL failure in a response (transport-level or the mutation's own), if any. */
+function graphqlFailure(json: unknown): string | undefined {
+  const body = json as {
+    errors?: readonly { message?: string }[];
+    data?: { issueSetAssignees?: { errors?: readonly string[] } | null } | null;
+  } | null;
+  if (body?.errors !== undefined && body.errors.length > 0) {
+    return body.errors.map((e) => e.message ?? "unknown error").join("; ");
+  }
+  const inner = body?.data?.issueSetAssignees;
+  if (inner === undefined || inner === null) {
+    return "no issueSetAssignees result";
+  }
+  return inner.errors !== undefined && inner.errors.length > 0
+    ? inner.errors.join("; ")
+    : undefined;
+}
+
 /** A CI job's whole plain-text trace; throws, quoting GitLab, on a non-ok status. */
 async function fetchJobTrace(parsed: {
   readonly projectPath: string;
@@ -100,6 +129,12 @@ export const GITLAB_TOOL_NAMES = [
   "gitlab_mr_merge",
   "gitlab_issue_list",
   "gitlab_issue_get",
+  "gitlab_issue_create",
+  "gitlab_issue_note_create",
+  "gitlab_mr_note_create",
+  "gitlab_issue_labels_add",
+  "gitlab_issue_assignees_add",
+  "gitlab_issue_state_set",
   "gitlab_pipeline_list",
   "gitlab_pipeline_get",
   "gitlab_pipeline_jobs_get",
@@ -268,6 +303,122 @@ export function registerGitlabTools(
     gitlabIssueGetSchema,
     (parsed) =>
       `/projects/${encodeURIComponent(parsed.projectPath)}/issues/${String(parsed.issueIid)}`,
+  );
+
+  /** One label: GitLab joins a label list with commas, so a comma inside one would split it in two. */
+  const labelSchema = z
+    .string()
+    .min(1)
+    .max(255)
+    .refine((l) => !l.includes(","), "a label cannot contain a comma");
+  const assigneeIdSchema = z.number().int().min(1);
+  const noteBodySchema = z.string().min(1).max(65_000);
+  const issuePath = (p: { projectPath: string; issueIid: number }): string =>
+    `/projects/${encodeURIComponent(p.projectPath)}/issues/${String(p.issueIid)}`;
+  const jsonBody = (method: "POST" | "PUT", body: unknown): RequestInit => ({
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  registerGitlabWriteTool(
+    "gitlab_issue_create",
+    { mutates: "gitlab.issue.create", recoverable: true },
+    "Create a new issue in a project, optionally with labels and assignees.",
+    projectPathArg.extend({
+      title: z.string().min(1).max(255),
+      description: z.string().max(65_000).optional(),
+      labels: z.array(labelSchema).max(50).optional(),
+      assigneeIds: z.array(assigneeIdSchema).max(20).optional(),
+    }),
+    (parsed) => `/projects/${encodeURIComponent(parsed.projectPath)}/issues`,
+    (parsed) =>
+      jsonBody("POST", {
+        title: parsed.title,
+        description: parsed.description,
+        labels: parsed.labels?.join(","),
+        assignee_ids: parsed.assigneeIds,
+      }),
+  );
+
+  registerGitlabWriteTool(
+    "gitlab_issue_note_create",
+    { mutates: "gitlab.issue.note.create", recoverable: true },
+    "Add a comment (note) to an issue; it posts as the authenticated user and changes nothing else.",
+    gitlabIssueGetSchema.extend({ body: noteBodySchema }),
+    (parsed) => `${issuePath(parsed)}/notes`,
+    (parsed) => jsonBody("POST", { body: parsed.body }),
+  );
+
+  registerGitlabWriteTool(
+    "gitlab_mr_note_create",
+    { mutates: "gitlab.mr.note.create", recoverable: true },
+    "Add a comment (note) to a merge request; it posts as the authenticated user and changes nothing else.",
+    gitlabMrGetSchema.extend({ body: noteBodySchema }),
+    (parsed) =>
+      `/projects/${encodeURIComponent(parsed.projectPath)}/merge_requests/${String(parsed.mergeRequestIid)}/notes`,
+    (parsed) => jsonBody("POST", { body: parsed.body }),
+  );
+
+  registerGitlabWriteTool(
+    "gitlab_issue_labels_add",
+    { mutates: "gitlab.issue.labels.add", recoverable: true },
+    "Add labels to an issue; it only adds, and cannot remove or replace any existing label.",
+    gitlabIssueGetSchema.extend({ labels: z.array(labelSchema).min(1).max(50) }),
+    issuePath,
+    (parsed) => jsonBody("PUT", { add_labels: parsed.labels.join(",") }),
+  );
+
+  // REST "Update an issue" can only REPLACE assignees (`assignee_ids`), so the add goes through
+  // GraphQL's issueSetAssignees in APPEND mode: one atomic server-side add that removes nobody.
+  registerWriteTool(
+    "gitlab_issue_assignees_add",
+    {
+      mutates: "gitlab.issue.assignees.add",
+      recoverable: true,
+      scopeTargetOf: (p) => ({ kind: "repo", value: p.projectPath }),
+    },
+    "Add assignees (usernames) to an issue; it only adds, and cannot remove any existing assignee.",
+    gitlabIssueGetSchema.extend({
+      assigneeUsernames: z.array(z.string().min(1).max(255)).min(1).max(20),
+    }),
+    async (parsed) => {
+      const token = requireProcessEnv("GITLAB_PAT");
+      // GitLab documents `Authorization: Bearer` for /api/graphql (PRIVATE-TOKEN is the REST
+      // header), so this one request bypasses glFetch. Never the private_token query parameter:
+      // a token in a URL is logged.
+      const res = await toRestFetchResult(
+        await fetch(graphqlUrl(), {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: SET_ASSIGNEES_APPEND,
+            variables: {
+              projectPath: parsed.projectPath,
+              iid: String(parsed.issueIid),
+              assigneeUsernames: parsed.assigneeUsernames,
+            },
+          }),
+        }),
+      );
+      if (!res.ok) {
+        throw new Error(`GitLab ${String(res.status)}: ${res.text.slice(0, 300)}`);
+      }
+      const failure = graphqlFailure(res.json);
+      if (failure !== undefined) {
+        throw new Error(`GitLab GraphQL: ${failure}`);
+      }
+      return jsonResult({ ok: true, assignees: parsed.assigneeUsernames });
+    },
+  );
+
+  registerGitlabWriteTool(
+    "gitlab_issue_state_set",
+    { mutates: "gitlab.issue.state.set", recoverable: true },
+    "Close or reopen an issue (stateEvent close or reopen); it changes only the state and can be reversed.",
+    gitlabIssueGetSchema.extend({ stateEvent: z.enum(["close", "reopen"]) }),
+    issuePath,
+    (parsed) => jsonBody("PUT", { state_event: parsed.stateEvent }),
   );
 
   const gitlabPipelineListSchema = projectPathArg.extend({

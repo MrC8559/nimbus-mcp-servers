@@ -62,6 +62,261 @@ cleanly can still fail to resolve once installed.
 0.1.0 and 0.1.1 were published by hand, before this pipeline existed, and carry no provenance.
 Every release since 0.2.0 came from it.
 
+## Publishing to the official Nimbus registry
+
+The Readwise connector also ships as a self-contained, signed Nimbus extension
+(`com.nimbus.readwise`), published to the **official Nimbus extension registry**: a static folder
+on this repository's `gh-pages` branch, served by GitHub Pages. The registry URL is the Pages URL,
+`https://nimbus-agent.github.io/nimbus-mcp-servers/`.
+
+### What the job does
+
+After the npm publish of every release, `release.yml` calls
+`.github/workflows/registry-publish.yml` — but only once the repository variable
+`OFFICIAL_REGISTRY_ENABLED` is `true`. Until the owner sets it, releases skip the job and stay
+green. The workflow can also be dispatched by hand from `main`, which is how the first publish
+happens. The workflow has four jobs.
+
+**`preflight`** has no environment, no secret, and read-only permissions, so nothing in it asks for
+an approval. It:
+
+1. refuses unless `OFFICIAL_REGISTRY_ENABLED` is `true`;
+2. refuses any ref but `refs/heads/main`. This is defence in depth behind the environment's
+   deployment-branch rule, which is the real boundary, since anyone who can push a branch can edit
+   that branch's copy of this workflow;
+3. fails clearly if `gh-pages` or its `index.json` is missing;
+4. runs `scripts/publish-registry.ts --check`, which compares the Readwise manifest version with
+   the registry's `index.json` and outputs `publish=true|false`.
+
+**`package`** runs only when `preflight` output `publish=true`, so a release with nothing to publish
+never prompts a reviewer. It holds the publisher key and never the registry root key. It:
+
+1. waits for a reviewer to approve the protected `official-registry` environment;
+2. checks out the release commit and `gh-pages`, with no persisted credential, and runs
+   `bun install --frozen-lockfile --ignore-scripts`;
+3. downloads the Nimbus CLI, which is not on npm, from a pinned Nimbus release (v10.17.0) and
+   verifies it against a SHA-256 written into the workflow as a literal;
+4. builds `dist/server.js` before any key exists;
+5. writes the publisher key to a file under `$RUNNER_TEMP` (mode 0600) and, in the very next step,
+   runs `scripts/publish-registry.ts --pack --publisher-id ...`. That re-checks the version against
+   the registry, stages the package (with the publisher block added to the staged manifest, never
+   the repository's, and with the connector's `evals/` folder), runs `nimbus extension sign`, and
+   packs it once with `nimbus extension pack`. It outputs the SHA-256 of that one `.tgz`;
+6. deletes the key file, whatever happened, and uploads the `.tgz` as an artifact.
+
+**`score`** runs the package's own code, so it has no environment, no secret, no checkout, and
+`contents: read` only. It downloads the `.tgz`, sets up the Linux sandbox the same way the Nimbus
+registry template does, downloads the Nimbus gateway of the same release (v10.17.0, checked against
+a SHA-256 written into the workflow as a literal and against the release's `SHA256SUMS`), and runs
+the registry action's `score-package` mode from that release on the `.tgz`. The action runs the
+baseline and the `evals/` suite in the sandbox and writes `scores.json`, which the job uploads. The
+score is of the bytes `package` signed: one `.tgz`, packed once. A directory is never scored,
+because Node and Bun gzip a directory differently.
+
+**`publish`** needs `package` and `score`. A `score` job that fails or times out skips it:
+nothing is published, the run is red, and the next release tries again. A skipped `score` is the
+nothing-to-publish case (the version is already in the registry), and that run is green. Two
+things do not stop it. An eval that errors does not fail `score`: its entry carries an error, and
+`maintain add` refuses it in `publish`, after the second approval. And a low score is still
+published, because a score is a stated fact, not a gate. The second approval is the moment to read
+the `score` job's summary. `publish` holds the
+registry root key and never the publisher key. It:
+
+1. waits for a reviewer to approve the `official-registry` environment a second time;
+2. checks out `gh-pages`, downloads the same pinned CLI and verifies it, and downloads the `.tgz`
+   and `scores.json` under `$RUNNER_TEMP`, never into the checkout;
+3. writes the root key to a file under `$RUNNER_TEMP` (mode 0600) and, in the very next step, runs
+   `scripts/publish-registry.ts --publish --package-sha256 <hash from package>`. The script refuses
+   a `.tgz` whose SHA-256 differs from that hash, because any job in the run can replace an
+   artifact. It then runs `nimbus registry maintain add <the .tgz> --scores <scores.json>`, which
+   adds the package, re-signs `index.json`, and signs the scores into it. `maintain add` checks
+   that `scores.json` names exactly this package by its hash and is well formed. It does not
+   check, and cannot check, that the score is true: the number is what the `score` job reported;
+4. deletes the key file, whatever happened, and commits the changed registry to `gh-pages` as
+   `registry: add <id>@<version> (sequence N)`.
+
+**Two approvals per publish.** `package` and `publish` both use the `official-registry`
+environment, so a reviewer approves twice, a few minutes apart. Two other layouts were rejected. A
+second environment for the publisher key would still need two approvals, and the owner would have
+to set it up. An environment without required reviewers for `package` would let any merge to `main`
+sign with the publisher key without approval.
+
+Both keys live in the one `official-registry` environment, so each secret is available to both
+keyed jobs. Keeping them apart rests on the workflow text and the tests that pin it, not on
+GitHub.
+
+**Releasing without a connectors release.** A change to this repository's publishing (a `docs` or
+`ci` change, for example) causes no release. Publish it by a manual dispatch of `registry-publish`.
+It needs the same two approvals.
+
+`scripts/publish-registry.test.ts` parses the workflow and fails if any of these protections is
+removed: the enable and `main` checks, the per-job permissions, `persist-credentials: false`, the
+`always()` key deletion, each key appearing only in the one job and step that writes it, the
+build-before-keys order, the install flags, the hash check, no `always()` on `publish`, and the
+`HEAD:gh-pages` push target.
+
+**What the score says.** The Readwise suite runs offline with no credentials. It tests what each
+tool does when there is no token. The baseline records whether the server starts and lists valid
+tools, and a failed baseline is signed too, as a stated fact.
+The score says nothing about the Readwise service or about real data, and it does not say the
+extension works or is safe. A published version is never re-scored, so the first scored version is
+the next one published.
+
+**Known trade-offs.** Harden Runner runs in `egress-policy: audit`, as in `release.yml`, not
+`block`: an allowlist that drifted from GitHub's release-asset hosts would fail releases, and audit
+still records every connection. And `publish` holds `contents: write` for its whole run, including
+the CLI; the token is never in those steps' environment or on disk, and only the push step
+supplies it, so splitting the push into a fifth job was not worth the extra hand-off.
+
+**What the package contains:** `nimbus.extension.json` (the staged manifest), `dist/server.js`,
+the connector's `README.md`, its `evals/` folder, and a `LICENSE`. The AGPL requires the licence text to travel with
+the code, so a connector without a LICENSE of its own — Readwise has none — ships the repository's
+root `LICENSE`.
+
+**The version rule.** The job publishes only when the `version` in
+`connectors/readwise/nimbus.extension.json` is not yet in the registry. A release that does not bump
+it publishes nothing. To ship a new extension build, bump that `version` in the PR that changes it.
+A registry version is immutable: the same version is never re-signed or replaced.
+
+The script refuses, before running the CLI, when the publisher key it is given differs from the
+one the registry records for the id, or the root key differs from the index's `rootKey`. Its
+messages name what the registry records, never anything read from or derived from a key file.
+**A publisher key can never change for an id** — installs pin it — so losing the publisher seed
+means publishing under a new id.
+
+**The script takes no path from its arguments**, only the mode (`--check`, `--pack` or `--publish`),
+`--publisher-id` and `--package-sha256`.
+Every file sits at a fixed place under a base the script determines itself. The workspace is the
+working directory, the repository root. The temp directory is `$RUNNER_TEMP`, else the OS temp
+directory. The workflow's steps put each file there:
+
+| File | Fixed place |
+| --- | --- |
+| Registry checkout (`gh-pages`) | `<workspace>/registry/` |
+| Bundle, built beforehand | `<workspace>/connectors/readwise/dist/server.js` |
+| Nimbus CLI | `<temp>/nimbus-cli/nimbus` (`nimbus.exe` on Windows) |
+| Publisher seed (`package` job) | `<temp>/nimbus-keys/publisher.key` |
+| Root seed (`publish` job) | `<temp>/nimbus-keys/root.key` |
+| Packed `.tgz` | `<temp>/nimbus-package/package.tgz` |
+| Scores | `<temp>/registry-scores/scores.json` |
+
+Each must exist as the right kind and must not be a symlink. The key files must be outside the
+registry and, on POSIX, readable by their owner only. A key in the workspace would be one
+`git add -A` away from being published. To run it by hand, put the files in those places, run
+`bun connectors/readwise/scripts/build-extension.ts`, and then run the script from the repository
+root. Neither `--pack` nor `--publish` builds.
+
+Older Nimbus CLIs read the manifest's `entry` and not `entrypoint`, so the staged manifest sets
+`entry` to the same value. The gateway reads `entry` first, so the shim changes nothing for it.
+
+### One-time setup (the owner)
+
+CI never bootstraps the registry: `nimbus registry maintain init` mints a fresh root key, so a
+bootstrap run in CI would either fail or replace the root of trust.
+
+1. Generate the publisher key: `nimbus extension keygen --out <publisher-key>`.
+2. Create the registry: `nimbus registry maintain init <dir> --key <root-key>`. Push `index.json`
+   and an empty `.nojekyll` as the root of an orphan `gh-pages` branch. `init` also creates an
+   empty `extensions/`, which git cannot track; it appears on `gh-pages` with the first publish,
+   since `maintain add` creates it.
+3. Enable GitHub Pages: deploy from a branch, `gh-pages`, folder `/ (root)`.
+4. Create the environment `official-registry` (Settings → Environments) with required reviewers
+   and its deployment branches limited to `main`, and **turn off "Allow administrators to bypass
+   configured protection rules"** — otherwise the reviewer gate does not bind admins. If a branch
+   ruleset covers `gh-pages`, it must let the workflow's `github-actions` push through. Give it the
+   secrets `NIMBUS_REGISTRY_ROOT_KEY`
+   and `NIMBUS_PUBLISHER_KEY` — each the full contents of its key file — and the variable
+   `NIMBUS_PUBLISHER_ID`, the publisher id to record. Put the keys in the environment, not in the
+   repository's secrets: environment secrets reach only the approved job.
+   The score flow needs nothing new here: `package` reads `NIMBUS_PUBLISHER_KEY` and
+   `NIMBUS_PUBLISHER_ID`, `publish` reads `NIMBUS_REGISTRY_ROOT_KEY`, and `score` reads none. Expect
+   two approval prompts per publish, one for `package` and one for `publish`.
+5. Keep offline backups of both seeds, then delete the plaintext key files. GitHub never shows a
+   secret again, so the environment is not a backup. Encrypt each file with a passphrase
+   (`age -p -o <key>.age <key>`) and keep the `.age` files on two offline drives in different
+   places. Each seed is a single 44-character line, so a paper copy of the root key in a safe is a
+   good last resort. The root key re-signs the index on every publish, and the publisher key can
+   never be replaced for an id.
+6. **Last**, set the repository variable `OFFICIAL_REGISTRY_ENABLED` to `true` (Settings → Secrets
+   and variables → Actions → Variables) — only after the environment, its secrets and variable,
+   the `gh-pages` branch and Pages are all in place. The environment in particular must already
+   exist, with required reviewers, deployment restricted to `main` and admin bypass off, before
+   you enable: a job
+   that names an environment which does not exist makes GitHub create it, with no protection
+   rules at all.
+7. Liveness checks are a second, optional setup. See [Liveness checks](#liveness-checks).
+
+## Liveness checks
+
+The registry can also publish a dated line for each extension saying what its runner observed.
+The file is `liveness.json`, signed with its own key. A line records what the registry's runner
+observed on that date and nothing more. It does not say that an extension works.
+
+The full description is in the Nimbus docs:
+[Liveness checks](https://github.com/nimbus-agent/Nimbus/blob/main/docs/registry-hosting.md#liveness-checks).
+
+### What the workflows do
+
+**Registry liveness** (`registry-liveness.yml`) runs on Mondays at 05:23 UTC, and by hand.
+
+- `check` holds no key and no secret. It runs the checks under the pinned registry action and
+  uploads the result. It runs the latest Nimbus release, not the pinned one. A later release that
+  changes the reply of the eval role could make an older pin sign "tests could not be run (run
+  failed)" until the pin is updated. That risk is accepted.
+- `sign` runs in the environment `registry-liveness`. It holds the liveness key
+  (`NIMBUS_REGISTRY_LIVENESS_KEY`), signs the result and publishes `liveness.json` to `gh-pages`.
+
+**Registry set liveness key** (`registry-set-liveness-key.yml`) is run by hand, once. A keyless
+preflight compares the public key in the repository variable `NIMBUS_REGISTRY_LIVENESS_PUBLIC_KEY`
+with the one in `index.json`. The `set-key` job runs in the protected `official-registry`
+environment. It runs `nimbus registry maintain set-liveness-key` with the root key and pushes
+`gh-pages`.
+
+`registry-liveness` has no required reviewers on purpose. A leaked liveness key can sign only dated
+check lines. It cannot sign an index, a package or a score, and clients only display those lines:
+no install, update or start depends on them (invariant I51).
+
+Both liveness jobs are skipped until the repository variable `OFFICIAL_REGISTRY_ENABLED` is
+`true` and the variable `NIMBUS_REGISTRY_LIVENESS_PUBLIC_KEY` is set, so a scheduled run before setup does
+nothing, and the `registry-liveness` environment is never created by a run.
+
+`maintain add` from Nimbus v10.17.0 carries `livenessKey` through every later publish. Do not move
+the pin in `registry-publish.yml` back below v10.17.0, or the next publish drops the key.
+
+### One-time setup (the owner)
+
+1. Generate the liveness key with Nimbus v10.17.0 or later:
+   `nimbus extension keygen --out <path outside every clone>`. The command writes the seed to the
+   file and prints the base64 public key. Back the seed up as for the other keys: encrypt it with
+   `age` and keep two offline copies.
+2. Create the environment `registry-liveness` with no required reviewers and its deployment
+   branches limited to `main`. Store the seed in it:
+
+   ```sh
+   gh secret set NIMBUS_REGISTRY_LIVENESS_KEY --env registry-liveness --repo nimbus-agent/nimbus-mcp-servers < <path>
+   ```
+
+   In PowerShell:
+
+   ```powershell
+   Get-Content -Raw <path> | gh secret set NIMBUS_REGISTRY_LIVENESS_KEY --env registry-liveness --repo nimbus-agent/nimbus-mcp-servers
+   ```
+
+3. Set the public key, the line step 1 printed:
+
+   ```sh
+   gh variable set NIMBUS_REGISTRY_LIVENESS_PUBLIC_KEY --repo nimbus-agent/nimbus-mcp-servers --body '<public key>'
+   ```
+
+4. Run **Registry set liveness key** and approve its `official-registry` deployment. It re-signs
+   `index.json` at `sequence + 1` with the new key recorded.
+5. Run **Registry liveness** once. From then on it runs every Monday at 05:23 UTC.
+
+A liveness run after step 3 but before step 4 fails in `sign`. That failure means step 4 is not
+done yet.
+
+To rotate the key, repeat steps 1 to 4 with a new key.
+
 ## After publishing
 
 The Nimbus gateway consumes this package from npm. It pins it in `packages/gateway/package.json`,
