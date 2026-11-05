@@ -38,6 +38,7 @@ import { registerBigeyeTools } from "../connectors/bigeye/src/server.ts";
 import { registerBitbucketTools } from "../connectors/bitbucket/src/tools.ts";
 import { registerCircleciTools } from "../connectors/circleci/src/tools.ts";
 import { registerConfluenceTools } from "../connectors/confluence/src/tools.ts";
+import { registerDiscordTools } from "../connectors/discord/src/tools.ts";
 import { registerFastmailTools } from "../connectors/fastmail/src/tools.ts";
 import { registerFluxTools } from "../connectors/flux/src/server.ts";
 import { registerGcpTools } from "../connectors/gcp/src/tools.ts";
@@ -222,6 +223,18 @@ const WRITES: Readonly<
       ["confluence_kb_append", "confluence.knowledge.write", { spaceKey: "ENG" }, "space:ENG"],
       ["confluence_page_update", "confluence.page.update", { pageId: "1234" }, "page:1234"],
       ["confluence_comment_add", "confluence.comment.add", { pageId: "1234" }, "page:1234"],
+      ["confluence_page_append", "confluence.page.append", { pageId: "1234" }, "page:1234"],
+    ],
+  },
+  discord: {
+    register: registerDiscordTools,
+    cases: [
+      [
+        "discord_message_post",
+        "discord.message.post",
+        { channelId: "123456789012345678" },
+        "channel:123456789012345678",
+      ],
     ],
   },
   fastmail: {
@@ -270,6 +283,10 @@ const WRITES: Readonly<
       ["github_pr_close", "github.pr.close", GITHUB_REPO, "repo:acme/api"],
       ["github_branch_delete", "github.branch.delete", GITHUB_REPO, "repo:acme/api"],
       ["github_tag_create", "github.tag.create", GITHUB_REPO, "repo:acme/api"],
+      ["github_issue_comment_create", "github.issue.comment.create", GITHUB_REPO, "repo:acme/api"],
+      ["github_issue_labels_add", "github.issue.labels.add", GITHUB_REPO, "repo:acme/api"],
+      ["github_issue_assignees_add", "github.issue.assignees.add", GITHUB_REPO, "repo:acme/api"],
+      ["github_issue_state_set", "github.issue.state.set", GITHUB_REPO, "repo:acme/api"],
     ],
   },
   "github-actions": {
@@ -295,6 +312,23 @@ const WRITES: Readonly<
         { projectPath: "group/repo" },
         "repo:group/repo",
       ],
+      ...(
+        [
+          ["gitlab_issue_create", "gitlab.issue.create"],
+          ["gitlab_issue_note_create", "gitlab.issue.note.create"],
+          ["gitlab_mr_note_create", "gitlab.mr.note.create"],
+          ["gitlab_issue_labels_add", "gitlab.issue.labels.add"],
+          ["gitlab_issue_assignees_add", "gitlab.issue.assignees.add"],
+          ["gitlab_issue_state_set", "gitlab.issue.state.set"],
+        ] as const
+      ).map(
+        ([tool, mutates]): WriteCase => [
+          tool,
+          mutates,
+          { projectPath: "group/repo" },
+          "repo:group/repo",
+        ],
+      ),
     ],
   },
   gmail: {
@@ -365,6 +399,12 @@ const WRITES: Readonly<
       ["jira_issue_create", "jira.issue.create", { projectKey: "ENG" }, "project:ENG"],
       ["jira_issue_update", "jira.issue.update", { issueKey: "ENG-7" }, "issue:ENG-7"],
       ["jira_comment_add", "jira.comment.add", { issueKey: "ENG-7" }, "issue:ENG-7"],
+      [
+        "jira_issue_transition",
+        "jira.issue.transition",
+        { issueKey: "ENG-7", transitionId: "31" },
+        "issue:ENG-7",
+      ],
     ],
   },
   kubernetes: {
@@ -466,6 +506,12 @@ const WRITES: Readonly<
       ["outlook_mail_send", "outlook.mail.send", MAIL_TO, "recipient:ada@example.com"],
       // Pinned as they are: a calendar event is scoped by its subject on create and by its
       // event id on delete, both under the `calendar` kind.
+      [
+        "outlook_draft_create",
+        "outlook.draft.create",
+        { to: "ana@example.com" },
+        "recipient:ana@example.com",
+      ],
       [
         "outlook_calendar_create",
         "outlook.calendar.create",
